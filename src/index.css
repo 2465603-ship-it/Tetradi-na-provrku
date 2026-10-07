@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-display: 'Fraunces', Georgia, serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-handwriting: 'Caveat', cursive;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    color: #0F172A;
+    background-color: #F8FAFC;
+  }
+
+  h1, h2, .font-display {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+
+  .font-mono-tabular {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .font-handwriting {
+    font-family: var(--font-handwriting);
+  }
+}
+
+/* Authentic Russian Primary School Notebook Paper Styles */
+.notebook-paper-slanted {
+  background-color: #FFFEF9;
+  background-image:
+    linear-gradient(180deg, transparent 0px, transparent 27px, #93C5FD 27px, #93C5FD 28px, transparent 28px, transparent 43px, #CBD5E1 43px, #CBD5E1 44px),
+    repeating-linear-gradient(115deg, transparent, transparent 38px, rgba(147, 197, 253, 0.32) 38px, rgba(147, 197, 253, 0.32) 39px);
+  background-size: 100% 44px, 100% 44px;
+}
+
+.notebook-paper-wide {
+  background-color: #FFFEF9;
+  background-image:
+    linear-gradient(180deg, transparent 0px, transparent 43px, #93C5FD 43px, #93C5FD 44px);
+  background-size: 100% 44px;
+}
+
+.notebook-paper-grid {
+  background-color: #FFFEF9;
+  background-image:
+    linear-gradient(to right, rgba(147, 197, 253, 0.45) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(147, 197, 253, 0.45) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}
