@@ -22,6 +22,7 @@ interface InteractiveNotebookSheetProps {
   onToggleLineMark: (lineIndex: number, symbol: MarginMarkSymbol) => void;
   onChangePaperRuling: (ruling: PaperRulingType) => void;
   onOpenPhotoScanner: () => void;
+  onUpdateAndReanalyzeLines?: (newLines: string[]) => Promise<void>;
 }
 
 const PEN_TOOLS: Array<{
@@ -44,10 +45,14 @@ export const InteractiveNotebookSheet: React.FC<InteractiveNotebookSheetProps> =
   onToggleLineMark,
   onChangePaperRuling,
   onOpenPhotoScanner,
+  onUpdateAndReanalyzeLines,
 }) => {
   const [viewMode, setViewMode] = useState<'interactive' | 'photo'>('interactive');
   const [activePenSymbol, setActivePenSymbol] = useState<MarginMarkSymbol>('/');
   const [imageLoadFailed, setImageLoadFailed] = useState(false);
+  const [isEditingLines, setIsEditingLines] = useState(false);
+  const [draftLinesText, setDraftLinesText] = useState('');
+  const [isReanalyzing, setIsReanalyzing] = useState(false);
 
   const paperClass =
     submission.paperRuling === 'squared-grid'
@@ -208,7 +213,7 @@ export const InteractiveNotebookSheet: React.FC<InteractiveNotebookSheetProps> =
               type="button"
               title={tool.hint}
               onClick={() => setActivePenSymbol(tool.symbol)}
-              className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+              className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 activePenSymbol === tool.symbol
                   ? 'bg-red-50 border-red-300 text-red-700 font-semibold'
                   : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300 hover:text-slate-900'
@@ -217,8 +222,73 @@ export const InteractiveNotebookSheet: React.FC<InteractiveNotebookSheetProps> =
               {tool.label}
             </button>
           ))}
+          {onUpdateAndReanalyzeLines && (
+            <button
+              type="button"
+              onClick={() => {
+                setDraftLinesText(submission.handwrittenLines.join('\n'));
+                setIsEditingLines(!isEditingLines);
+              }}
+              className="ml-1 px-2.5 py-1 text-xs font-semibold rounded-md border border-sky-300 bg-sky-50 text-sky-900 hover:bg-sky-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {isEditingLines ? 'Скрыть редактор строк' : 'Изменить текст на листе'}
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Inline Editor for Notebook Lines */}
+      {isEditingLines && onUpdateAndReanalyzeLines && (
+        <div className="p-4 border-b border-slate-200 bg-sky-50/40 space-y-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-slate-800">
+              Редактирование рукописных строк ученика ({submission.studentName}, {submission.classGroup}):
+            </span>
+            <button
+              type="button"
+              onClick={() => setIsEditingLines(false)}
+              className="text-xs text-slate-500 hover:text-slate-800"
+            >
+              Закрыть
+            </button>
+          </div>
+          <textarea
+            rows={5}
+            value={draftLinesText}
+            onChange={(e) => setDraftLinesText(e.target.value)}
+            placeholder="Введите строки работы ученика (каждая строка с новой строчки)..."
+            className="w-full p-2.5 text-xs bg-white border border-slate-300 rounded-lg font-sans focus:outline-none focus:ring-2 focus:ring-sky-600"
+          />
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[11px] text-slate-500">
+              После сохранения система автоматически перепроверит орфограммы и примеры по нормам ФГОС.
+            </span>
+            <button
+              type="button"
+              disabled={isReanalyzing}
+              onClick={async () => {
+                const lines = draftLinesText
+                  .split(/\r?\n/)
+                  .map((s) => s.trim())
+                  .filter(Boolean);
+                if (lines.length === 0) return;
+                setIsReanalyzing(true);
+                try {
+                  await onUpdateAndReanalyzeLines(lines);
+                  setIsEditingLines(false);
+                } finally {
+                  setIsReanalyzing(false);
+                }
+              }}
+              className="px-4 py-1.5 bg-slate-900 hover:bg-slate-800 disabled:bg-slate-400 text-white text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer"
+            >
+              {isReanalyzing
+                ? 'Проверяем строки...'
+                : 'Обновить лист и найти ошибки'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Main Stage Content */}
       {viewMode === 'interactive' ? (

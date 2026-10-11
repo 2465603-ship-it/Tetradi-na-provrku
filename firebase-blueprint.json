@@ -1,0 +1,137 @@
+{
+  "entities": {
+    "TeacherProfile": {
+      "title": "TeacherProfile",
+      "description": "Private teacher profile including phone number (PII), full name, school, and qualification.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the teacher.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Full name of the primary school teacher.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "phone": {
+          "type": "string",
+          "description": "Verified phone number of the teacher.",
+          "minLength": 5,
+          "maxLength": 30
+        },
+        "schoolName": {
+          "type": "string",
+          "description": "School name or number.",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "qualification": {
+          "type": "string",
+          "description": "Teacher qualification category.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of profile creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last profile update."
+        }
+      },
+      "required": [
+        "ownerId",
+        "fullName",
+        "phone",
+        "schoolName",
+        "qualification",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SchoolClass": {
+      "title": "SchoolClass",
+      "description": "Primary school class created and managed by a teacher.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the teacher who owns this class.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Class name, e.g. 2 «А» класс.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "gradeLevel": {
+          "type": "integer",
+          "description": "Grade level from 1 to 4."
+        },
+        "academicYear": {
+          "type": "string",
+          "description": "Academic year, e.g. 2026/2027.",
+          "minLength": 4,
+          "maxLength": 20
+        },
+        "defaultRuling": {
+          "type": "string",
+          "description": "Default notebook ruling for this class.",
+          "enum": ["lined-slanted", "lined-wide", "squared-grid"]
+        },
+        "studentCount": {
+          "type": "integer",
+          "description": "Number of students in the roster."
+        },
+        "studentsList": {
+          "type": "string",
+          "description": "Newline-delimited roster of student names.",
+          "minLength": 0,
+          "maxLength": 2000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of class creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last class update."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "gradeLevel",
+        "academicYear",
+        "defaultRuling",
+        "studentCount",
+        "studentsList",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/teachers/{teacherId}": {
+      "schema": { "$ref": "#/entities/TeacherProfile" },
+      "description": "Isolated private teacher profile documents keyed by teacher UID."
+    },
+    "/classes/{classId}": {
+      "schema": { "$ref": "#/entities/SchoolClass" },
+      "description": "School classes owned by teachers."
+    }
+  }
+}

@@ -1,0 +1,202 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reusable Hardened Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && (
+        request.auth.token.email_verified == true ||
+        request.auth.token.firebase.sign_in_provider == 'phone'
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Validation Blueprint: TeacherProfile
+    function isValidTeacherProfile(data) {
+      return data.keys().hasAll([
+        'ownerId',
+        'fullName',
+        'phone',
+        'schoolName',
+        'qualification',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'ownerId',
+        'fullName',
+        'phone',
+        'schoolName',
+        'qualification',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.ownerId is string &&
+      data.ownerId.size() >= 1 &&
+      data.ownerId.size() <= 128 &&
+      data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.ownerId == request.auth.uid &&
+      data.fullName is string &&
+      data.fullName.size() >= 2 &&
+      data.fullName.size() <= 120 &&
+      data.phone is string &&
+      data.phone.size() >= 5 &&
+      data.phone.size() <= 30 &&
+      data.schoolName is string &&
+      data.schoolName.size() >= 1 &&
+      data.schoolName.size() <= 150 &&
+      data.qualification is string &&
+      data.qualification.size() >= 1 &&
+      data.qualification.size() <= 100 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: SchoolClass
+    function isValidSchoolClass(data) {
+      return data.keys().hasAll([
+        'ownerId',
+        'name',
+        'gradeLevel',
+        'academicYear',
+        'defaultRuling',
+        'studentCount',
+        'studentsList',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'ownerId',
+        'name',
+        'gradeLevel',
+        'academicYear',
+        'defaultRuling',
+        'studentCount',
+        'studentsList',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.ownerId is string &&
+      data.ownerId.size() >= 1 &&
+      data.ownerId.size() <= 128 &&
+      data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.ownerId == request.auth.uid &&
+      data.name is string &&
+      data.name.size() >= 1 &&
+      data.name.size() <= 60 &&
+      data.gradeLevel is int &&
+      data.gradeLevel >= 1 &&
+      data.gradeLevel <= 4 &&
+      data.academicYear is string &&
+      data.academicYear.size() >= 4 &&
+      data.academicYear.size() <= 20 &&
+      data.defaultRuling is string &&
+      data.defaultRuling.size() <= 30 &&
+      data.defaultRuling in ['lined-slanted', 'lined-wide', 'squared-grid'] &&
+      data.studentCount is int &&
+      data.studentCount >= 0 &&
+      data.studentCount <= 50 &&
+      data.studentsList is string &&
+      data.studentsList.size() >= 0 &&
+      data.studentsList.size() <= 2000 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Collection 1: /teachers/{teacherId} (PII Isolated to Owner only, no list allowed)
+    match /teachers/{teacherId} {
+      allow get: if isVerifiedUser() && isValidId(teacherId) && request.auth.uid == teacherId;
+      allow list: if false;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(teacherId) &&
+        request.auth.uid == teacherId &&
+        isValidTeacherProfile(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(teacherId) &&
+        isValidTeacherProfile(incoming()) &&
+        request.auth.uid == teacherId &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'fullName',
+            'phone',
+            'schoolName',
+            'qualification',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser() &&
+        isValidId(teacherId) &&
+        request.auth.uid == teacherId &&
+        existing().ownerId == request.auth.uid;
+    }
+
+    // Collection 2: /classes/{classId}
+    match /classes/{classId} {
+      allow get: if isVerifiedUser() &&
+        isValidId(classId) &&
+        existing().ownerId == request.auth.uid;
+
+      allow list: if isVerifiedUser() &&
+        resource.data.ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(classId) &&
+        isValidSchoolClass(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/teachers/$(incoming().ownerId));
+
+      allow update: if isVerifiedUser() &&
+        isValidId(classId) &&
+        isValidSchoolClass(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'gradeLevel',
+            'academicYear',
+            'defaultRuling',
+            'studentCount',
+            'studentsList',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser() &&
+        isValidId(classId) &&
+        existing().ownerId == request.auth.uid;
+    }
+  }
+}

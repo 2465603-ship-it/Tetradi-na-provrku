@@ -1,19 +1,35 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
+import { onAuthStateChanged, User } from 'firebase/auth';
 import {
   NotebookSubmission,
   SubjectType,
   MarginMarkSymbol,
   PaperRulingType,
   NotebookError,
+  TeacherProfileData,
+  SchoolClassItem,
 } from './types/notebook';
 import {
   INITIAL_SUBMISSIONS,
   TEACHER_PROFILE,
   FGOS_GRADING_NORMS,
   TEACHER_STAMPS,
+  SAMPLE_PHOTOS,
 } from './data/initialSubmissions';
 import { InteractiveNotebookSheet } from './components/InteractiveNotebookSheet';
 import { PhotoCheckModal } from './components/PhotoCheckModal';
+import { TeacherCabinetView } from './components/TeacherCabinetView';
+import {
+  auth,
+  fetchTeacherProfileFromFirestore,
+  upsertTeacherProfileInFirestore,
+  createClassInFirestore,
+  updateClassInFirestore,
+  deleteClassFromFirestore,
+  subscribeToTeacherClasses,
+  signInTeacherWithGoogle,
+  signOutTeacher,
+} from './firebase';
 import {
   BookOpen,
   Camera,
@@ -28,9 +44,43 @@ import {
   Search,
   Sparkles,
   ArrowRight,
+  UserCircle2,
 } from 'lucide-react';
 
-type ActiveTab = 'desk' | 'journal' | 'remediation' | 'norms';
+type ActiveTab = 'desk' | 'journal' | 'remediation' | 'norms' | 'cabinet';
+
+const DEFAULT_CLASSES: SchoolClassItem[] = [
+  {
+    id: 'cls_2a',
+    ownerId: 'default_teacher',
+    name: '2 «А» класс',
+    gradeLevel: 2,
+    academicYear: '2026/2027',
+    defaultRuling: 'lined-slanted',
+    studentCount: 3,
+    studentsList: 'Соколов Артём\nМорозов Даниил\nКозлов Илья',
+  },
+  {
+    id: 'cls_3b',
+    ownerId: 'default_teacher',
+    name: '3 «Б» класс',
+    gradeLevel: 3,
+    academicYear: '2026/2027',
+    defaultRuling: 'squared-grid',
+    studentCount: 2,
+    studentsList: 'Белова Мария\nКузнецова София',
+  },
+  {
+    id: 'cls_1v',
+    ownerId: 'default_teacher',
+    name: '1 «В» класс',
+    gradeLevel: 1,
+    academicYear: '2026/2027',
+    defaultRuling: 'lined-slanted',
+    studentCount: 1,
+    studentsList: 'Лебедев Максим',
+  },
+];
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('desk');
@@ -43,9 +93,105 @@ export default function App() {
     INITIAL_SUBMISSIONS[0].errors[0]?.id || null
   );
 
+  // Teacher Profile & Classes State
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [teacherProfile, setTeacherProfile] =
+    useState<TeacherProfileData | null>(() => {
+      try {
+        const saved = localStorage.getItem('tetrad_plus_teacher_profile');
+        if (saved) return JSON.parse(saved);
+      } catch {
+        // ignore storage errors
+      }
+      return null;
+    });
+
+  const [classes, setClasses] = useState<SchoolClassItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('tetrad_plus_teacher_classes');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return DEFAULT_CLASSES;
+  });
+
+  // Persist local cabinet changes
+  useEffect(() => {
+    try {
+      if (teacherProfile) {
+        localStorage.setItem(
+          'tetrad_plus_teacher_profile',
+          JSON.stringify(teacherProfile)
+        );
+      } else {
+        localStorage.removeItem('tetrad_plus_teacher_profile');
+      }
+    } catch {
+      // ignore
+    }
+  }, [teacherProfile]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'tetrad_plus_teacher_classes',
+        JSON.stringify(classes)
+      );
+    } catch {
+      // ignore
+    }
+  }, [classes]);
+
+  // Listen to Firebase Auth state & sync Firestore profile + classes when authenticated
+  useEffect(() => {
+    let unsubscribeClasses: (() => void) | null = null;
+
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      setFirebaseUser(user);
+      if (unsubscribeClasses) {
+        unsubscribeClasses();
+        unsubscribeClasses = null;
+      }
+
+      if (user) {
+        try {
+          const remoteProfile = await fetchTeacherProfileFromFirestore(user.uid);
+          if (remoteProfile) {
+            setTeacherProfile(remoteProfile);
+          } else if (teacherProfile) {
+            await upsertTeacherProfileInFirestore(user.uid, teacherProfile);
+          }
+
+          unsubscribeClasses = subscribeToTeacherClasses(
+            user.uid,
+            (remoteClasses) => {
+              if (remoteClasses.length > 0) {
+                setClasses(remoteClasses);
+              }
+            }
+          );
+        } catch (err) {
+          console.warn('Firestore profile sync skipped:', err);
+        }
+      }
+    });
+
+    return () => {
+      unsubscribeAuth();
+      if (unsubscribeClasses) unsubscribeClasses();
+    };
+  }, []);
+
   // Filters for the queue and journal
-  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'checked'>('all');
+  const [statusFilter, setStatusFilter] = useState<
+    'all' | 'pending' | 'checked'
+  >('all');
   const [subjectFilter, setSubjectFilter] = useState<'all' | SubjectType>('all');
+  const [classFilter, setClassFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
 
   // Modal & interactive feedback states
@@ -59,7 +205,9 @@ export default function App() {
   const [newErrorLine, setNewErrorLine] = useState<number>(3);
   const [newErrorWrong, setNewErrorWrong] = useState('');
   const [newErrorCorrect, setNewErrorCorrect] = useState('');
-  const [newErrorRule, setNewErrorRule] = useState('Безударная гласная в корне слова');
+  const [newErrorRule, setNewErrorRule] = useState(
+    'Безударная гласная в корне слова'
+  );
   const [newErrorMark, setNewErrorMark] = useState<MarginMarkSymbol>('/');
 
   // AI Remediation card state
@@ -72,6 +220,7 @@ export default function App() {
     return submissions.filter((sub) => {
       if (statusFilter !== 'all' && sub.status !== statusFilter) return false;
       if (subjectFilter !== 'all' && sub.subject !== subjectFilter) return false;
+      if (classFilter !== 'all' && sub.classGroup !== classFilter) return false;
       if (searchQuery.trim() !== '') {
         const q = searchQuery.toLowerCase();
         const matchName = sub.studentName.toLowerCase().includes(q);
@@ -81,7 +230,7 @@ export default function App() {
       }
       return true;
     });
-  }, [submissions, statusFilter, subjectFilter, searchQuery]);
+  }, [submissions, statusFilter, subjectFilter, classFilter, searchQuery]);
 
   const currentSubmission = useMemo(() => {
     return (
@@ -109,6 +258,198 @@ export default function App() {
     return 2;
   }, [currentSubmission]);
 
+  // Handlers for Teacher Personal Cabinet & Classes
+  const handleCompletePhoneRegistration = async (
+    newProfile: TeacherProfileData,
+    initialClass?: Omit<SchoolClassItem, 'id' | 'ownerId'>
+  ) => {
+    const activeUid = firebaseUser?.uid || newProfile.ownerId;
+    const finalProfile: TeacherProfileData = {
+      ...newProfile,
+      ownerId: activeUid,
+      isCloudSynced: Boolean(firebaseUser),
+    };
+    setTeacherProfile(finalProfile);
+
+    if (firebaseUser) {
+      try {
+        await upsertTeacherProfileInFirestore(firebaseUser.uid, finalProfile);
+      } catch (e) {
+        console.warn('Could not save teacher profile to Firestore:', e);
+      }
+    }
+
+    if (initialClass) {
+      const existsAlready = classes.some(
+        (c) => c.name.toLowerCase() === initialClass.name.toLowerCase()
+      );
+      if (!existsAlready) {
+        await handleCreateClass(initialClass, activeUid);
+      }
+    }
+
+    setApprovalBanner(
+      `Личный кабинет учителя ${finalProfile.fullName} (${finalProfile.phone}) успешно создан!`
+    );
+    setTimeout(() => setApprovalBanner(null), 4000);
+  };
+
+  const handleUpdateTeacherProfile = async (updated: TeacherProfileData) => {
+    setTeacherProfile(updated);
+    if (firebaseUser) {
+      try {
+        await upsertTeacherProfileInFirestore(firebaseUser.uid, updated);
+      } catch (e) {
+        console.warn('Could not update profile in Firestore:', e);
+      }
+    }
+  };
+
+  const handleCreateClass = async (
+    newClsData: Omit<SchoolClassItem, 'id' | 'ownerId'>,
+    overrideUid?: string
+  ) => {
+    const uid =
+      overrideUid ||
+      firebaseUser?.uid ||
+      teacherProfile?.ownerId ||
+      'default_teacher';
+    const newId = `cls_${Date.now()}`;
+    const newClassItem: SchoolClassItem = {
+      id: newId,
+      ownerId: uid,
+      ...newClsData,
+    };
+
+    setClasses((prev) => [newClassItem, ...prev]);
+
+    if (firebaseUser) {
+      try {
+        await upsertTeacherProfileInFirestore(firebaseUser.uid, {
+          fullName: teacherProfile?.fullName || TEACHER_PROFILE.name,
+          phone: teacherProfile?.phone || '+7 (916) 450-12-89',
+          schoolName: teacherProfile?.schoolName || TEACHER_PROFILE.school,
+          qualification: teacherProfile?.qualification || TEACHER_PROFILE.role,
+        });
+        await createClassInFirestore(firebaseUser.uid, newId, newClsData);
+      } catch (e) {
+        console.warn('Could not create class in Firestore:', e);
+      }
+    }
+
+    setApprovalBanner(`Класс «${newClsData.name}» добавлен в ваш личный кабинет`);
+    setTimeout(() => setApprovalBanner(null), 3500);
+  };
+
+  const handleUpdateClass = async (
+    classId: string,
+    updatedData: Omit<SchoolClassItem, 'id' | 'ownerId'>
+  ) => {
+    setClasses((prev) =>
+      prev.map((c) => (c.id === classId ? { ...c, ...updatedData } : c))
+    );
+    if (firebaseUser) {
+      try {
+        await updateClassInFirestore(firebaseUser.uid, classId, updatedData);
+      } catch (e) {
+        console.warn('Could not update class in Firestore:', e);
+      }
+    }
+  };
+
+  const handleDeleteClass = async (classId: string) => {
+    setClasses((prev) => prev.filter((c) => c.id !== classId));
+    if (firebaseUser) {
+      try {
+        await deleteClassFromFirestore(classId);
+      } catch (e) {
+        console.warn('Could not delete class in Firestore:', e);
+      }
+    }
+  };
+
+  const handleCreateNotebookForStudent = (
+    studentName: string,
+    classItem: SchoolClassItem,
+    subject: SubjectType
+  ) => {
+    const isMath = subject === 'Математика';
+    const ruling: PaperRulingType = isMath
+      ? 'squared-grid'
+      : classItem.defaultRuling;
+    const isFirstGrade = classItem.gradeLevel === 1;
+
+    const newSub: NotebookSubmission = {
+      id: `sub_${Date.now()}`,
+      studentName,
+      classGroup: classItem.name,
+      subject,
+      paperRuling: ruling,
+      assignmentTitle: isMath
+        ? 'Домашняя работа · Примеры и текстовая задача'
+        : 'Домашняя работа · Списывание и словарные слова',
+      submittedDate: '9 октября',
+      status: 'pending',
+      isFirstGradeNoGrades: isFirstGrade,
+      verbalStamp: isFirstGrade
+        ? 'Молодец! Старайся писать ровно.'
+        : 'Хорошая работа! Проверь выделенные места.',
+      contentGrade: 5,
+      calligraphyGrade: 5,
+      handwrittenLines: isMath
+        ? [
+            '9 октября.',
+            'Домашняя работа.',
+            'Задача № 8.',
+            '1) 15 + 12 = 27 (шт.) — всего тетрадей в папке.',
+            'Ответ: 27 тетрадей.',
+            'Примеры: 34 + 25 = 59     68 - 14 = 54',
+          ]
+        : [
+            'Девятое октября.',
+            'Домашняя работа.',
+            'Упражнение 52.',
+            'Золотая осень украсила берёзки в роще.',
+            'Птицы готовятся к отлёту в тёплые края.',
+          ],
+      photoSampleUrl: isMath ? SAMPLE_PHOTOS.math : SAMPLE_PHOTOS.russian,
+      teacherSummary: `Новая тетрадь ученика ${studentName} (${classItem.name}) открыта из личного кабинета учителя.`,
+      parentMessage: `Здравствуйте! Домашняя работа ученика (${studentName}, ${classItem.name}) по предмету «${subject}» проверена.`,
+      errors: [],
+      customLineMarks: [],
+      remediationTasks: [],
+    };
+
+    setSubmissions((prev) => [newSub, ...prev]);
+    setSelectedSubmissionId(newSub.id);
+    setSelectedErrorId(null);
+    setActiveTab('desk');
+    setApprovalBanner(
+      `Открыта тетрадь: ${studentName} (${classItem.name} · ${subject})`
+    );
+    setTimeout(() => setApprovalBanner(null), 3500);
+  };
+
+  const handleConnectGoogleCloud = async () => {
+    try {
+      const cred = await signInTeacherWithGoogle();
+      if (cred.user && teacherProfile) {
+        await upsertTeacherProfileInFirestore(cred.user.uid, teacherProfile);
+      }
+      setApprovalBanner('Облачная синхронизация Firebase успешно подключена!');
+      setTimeout(() => setApprovalBanner(null), 3500);
+    } catch (err) {
+      console.warn('Google sign-in cancelled or unavailable:', err);
+    }
+  };
+
+  const handleLogoutCabinet = async () => {
+    setTeacherProfile(null);
+    if (firebaseUser) {
+      await signOutTeacher();
+    }
+  };
+
   // Handlers for updating current submission
   const updateSubmission = (
     id: string,
@@ -126,7 +467,9 @@ export default function App() {
           ? { ...err, confirmedByTeacher: !err.confirmedByTeacher }
           : err
       );
-      const activeErrs = updatedErrors.filter((e) => e.confirmedByTeacher).length;
+      const activeErrs = updatedErrors.filter(
+        (e) => e.confirmedByTeacher
+      ).length;
       const autoGrade =
         activeErrs === 0 ? 5 : activeErrs <= 2 ? 4 : activeErrs <= 5 ? 3 : 2;
       return {
@@ -200,20 +543,30 @@ export default function App() {
       id: `err-custom-${Date.now()}`,
       lineIndex: Math.max(
         0,
-        Math.min(currentSubmission.handwrittenLines.length - 1, newErrorLine - 1)
+        Math.min(
+          currentSubmission.handwrittenLines.length - 1,
+          newErrorLine - 1
+        )
       ),
       wrongFragment: newErrorWrong.trim(),
       correctFragment: newErrorCorrect.trim(),
       ruleName: newErrorRule.trim() || 'Замечание учителя',
       explanation: `Исправление учителя: «${newErrorWrong.trim()}» → «${newErrorCorrect.trim()}»`,
-      errorType: newErrorMark === '!' ? 'calculation' : newErrorMark === 'V' ? 'punctuation' : 'orthography',
+      errorType:
+        newErrorMark === '!'
+          ? 'calculation'
+          : newErrorMark === 'V'
+          ? 'punctuation'
+          : 'orthography',
       marginMark: newErrorMark,
       confirmedByTeacher: true,
     };
 
     updateSubmission(currentSubmission.id, (sub) => {
       const updatedErrors = [...sub.errors, newErr];
-      const activeCount = updatedErrors.filter((x) => x.confirmedByTeacher).length;
+      const activeCount = updatedErrors.filter(
+        (x) => x.confirmedByTeacher
+      ).length;
       const autoGrade =
         activeCount === 0 ? 5 : activeCount <= 2 ? 4 : activeCount <= 5 ? 3 : 2;
       return {
@@ -243,7 +596,6 @@ export default function App() {
     );
     setTimeout(() => setApprovalBanner(null), 4000);
 
-    // Move to next pending notebook if available
     const nextPending = submissions.find(
       (s) => s.id !== currentSubmission.id && s.status === 'pending'
     );
@@ -255,7 +607,9 @@ export default function App() {
 
   const handleCopyParentMessage = () => {
     if (navigator.clipboard) {
-      navigator.clipboard.writeText(currentSubmission.parentMessage).catch(() => {});
+      navigator.clipboard
+        .writeText(currentSubmission.parentMessage)
+        .catch(() => {});
     }
     setCopiedParentFeedback(true);
     setTimeout(() => setCopiedParentFeedback(false), 2500);
@@ -266,6 +620,60 @@ export default function App() {
     setSelectedSubmissionId(newSub.id);
     setSelectedErrorId(newSub.errors[0]?.id || null);
     setActiveTab('desk');
+  };
+
+  const handleUpdateAndReanalyzeLines = async (newLines: string[]) => {
+    try {
+      const response = await fetch('/api/check-notebook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subject: currentSubmission.subject,
+          gradeLevel: currentSubmission.classGroup,
+          assignmentTitle: currentSubmission.assignmentTitle,
+          studentWrittenText: newLines.join('\n'),
+        }),
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      const res = data.result;
+      if (!res) return;
+
+      const mappedErrors: NotebookError[] = Array.isArray(res.errors)
+        ? res.errors.map((e: any, idx: number) => ({
+            id: `err-re-${Date.now()}-${idx}`,
+            lineIndex: typeof e.lineIndex === 'number' ? e.lineIndex : 0,
+            wrongFragment: e.wrongFragment || '',
+            correctFragment: e.correctFragment || '',
+            ruleName: e.ruleName || 'Правило ФГОС НОО',
+            explanation: e.explanation || '',
+            errorType: e.errorType || 'orthography',
+            marginMark: e.marginMark || '/',
+            confirmedByTeacher: true,
+          }))
+        : [];
+
+      updateSubmission(currentSubmission.id, (sub) => ({
+        ...sub,
+        handwrittenLines: newLines,
+        errors: mappedErrors,
+        contentGrade: res.recommendedGrade || 4,
+        calligraphyGrade: res.calligraphyScore || sub.calligraphyGrade,
+        verbalStamp: res.studentPraise || sub.verbalStamp,
+        teacherSummary: res.summary || sub.teacherSummary,
+        parentMessage: res.parentFeedback || sub.parentMessage,
+        remediationTasks: Array.isArray(res.remediationTasks)
+          ? res.remediationTasks
+          : sub.remediationTasks,
+      }));
+      setSelectedErrorId(mappedErrors[0]?.id || null);
+      setApprovalBanner(
+        `Текст на листе тетради (${currentSubmission.studentName}, ${currentSubmission.classGroup}) обновлён и проверен!`
+      );
+      setTimeout(() => setApprovalBanner(null), 3500);
+    } catch (err) {
+      console.warn('Re-analysis warning:', err);
+    }
   };
 
   const handleGenerateRemediationCard = async (sub: NotebookSubmission) => {
@@ -295,6 +703,11 @@ export default function App() {
     }
   };
 
+  const displayTeacherName = teacherProfile?.fullName || TEACHER_PROFILE.name;
+  const displayTeacherSchool = teacherProfile
+    ? `${teacherProfile.schoolName} · ${teacherProfile.phone}`
+    : TEACHER_PROFILE.school;
+
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC] text-[#0F172A]">
       {/* 3-Zone Top Bar Contract */}
@@ -311,7 +724,7 @@ export default function App() {
           ТетрадьПлюс
         </a>
 
-        {/* Zone 2: 4 clean navigation links with hover/active underline */}
+        {/* Zone 2: 5 clean navigation links with hover/active underline */}
         <nav
           aria-label="Основная навигация"
           className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600"
@@ -326,6 +739,17 @@ export default function App() {
             }`}
           >
             Проверка тетрадей
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('cabinet')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 cursor-pointer ${
+              activeTab === 'cabinet'
+                ? 'border-red-600 text-slate-900 font-semibold'
+                : 'border-transparent hover:text-slate-900'
+            }`}
+          >
+            Личный кабинет ({classes.length} кл.)
           </button>
           <button
             type="button"
@@ -362,15 +786,23 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: 1 Primary Action */}
-        <div className="flex items-center gap-3">
+        {/* Zone 3: Primary Actions */}
+        <div className="flex items-center gap-2.5">
+          <button
+            type="button"
+            onClick={() => setActiveTab('cabinet')}
+            className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <UserCircle2 className="w-3.5 h-3.5 text-slate-600" />
+            <span>{teacherProfile ? 'Мои классы' : 'Вход по телефону'}</span>
+          </button>
           <button
             type="button"
             onClick={() => setIsPhotoModalOpen(true)}
             className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Camera className="w-3.5 h-3.5" />
-            <span>Загрузить фото тетради</span>
+            <span>Камера / Загрузить фото</span>
           </button>
         </div>
       </header>
@@ -387,6 +819,17 @@ export default function App() {
           }`}
         >
           Проверка тетрадей
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('cabinet')}
+          className={`px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap shrink-0 ${
+            activeTab === 'cabinet'
+              ? 'bg-slate-900 text-white'
+              : 'text-slate-600 hover:bg-slate-100'
+          }`}
+        >
+          Личный кабинет ({classes.length})
         </button>
         <button
           type="button"
@@ -423,7 +866,7 @@ export default function App() {
         </button>
       </div>
 
-      {/* Confirmation Banner when a notebook is approved */}
+      {/* Confirmation Banner */}
       {approvalBanner && (
         <div
           role="status"
@@ -445,39 +888,69 @@ export default function App() {
 
       {/* Main Content Container */}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-8 py-6">
+        {/* VIEW 5: TEACHER PERSONAL CABINET & PHONE REGISTRATION */}
+        {activeTab === 'cabinet' && (
+          <TeacherCabinetView
+            teacherProfile={teacherProfile}
+            classes={classes}
+            isFirebaseAuthenticated={Boolean(firebaseUser)}
+            firebaseEmail={firebaseUser?.email || null}
+            onCompletePhoneRegistration={handleCompletePhoneRegistration}
+            onUpdateProfile={handleUpdateTeacherProfile}
+            onCreateClass={(cls) => handleCreateClass(cls)}
+            onUpdateClass={handleUpdateClass}
+            onDeleteClass={handleDeleteClass}
+            onCreateNotebookForStudent={handleCreateNotebookForStudent}
+            onConnectGoogleCloud={handleConnectGoogleCloud}
+            onLogout={handleLogoutCabinet}
+          />
+        )}
+
         {/* VIEW 1: TEACHER DESK (Проверка тетрадей) */}
         {activeTab === 'desk' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             {/* LEFT PANEL: Student Stack & Filters (3 cols) */}
             <aside className="lg:col-span-3 space-y-4">
-              {/* Teacher Profile Strip */}
-              <div className="p-4 bg-white border border-slate-200 rounded-xl flex items-center gap-3">
-                {!avatarError ? (
-                  <img
-                    src={TEACHER_PROFILE.avatarUrl}
-                    alt={TEACHER_PROFILE.name}
-                    referrerPolicy="no-referrer"
-                    onError={() => setAvatarError(true)}
-                    className="w-11 h-11 rounded-full object-cover border border-slate-200 shrink-0"
-                  />
-                ) : (
-                  <div className="w-11 h-11 rounded-full bg-slate-800 text-white flex items-center justify-center font-semibold text-sm shrink-0">
-                    ЕС
-                  </div>
-                )}
-                <div className="min-w-0">
-                  <h2 className="text-sm font-semibold text-slate-900 truncate">
-                    {TEACHER_PROFILE.name}
-                  </h2>
-                  <p className="text-xs text-slate-500 truncate">
-                    {TEACHER_PROFILE.school}
-                  </p>
-                  <div className="flex items-center gap-2 text-xs text-slate-600 mt-1 font-mono-tabular">
-                    <span>К проверке: {pendingCount}</span>
-                    <span aria-hidden="true">·</span>
-                    <span>Готово: {checkedCount}</span>
+              {/* Teacher Profile Strip with direct link to Personal Cabinet */}
+              <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-3">
+                <div className="flex items-center gap-3">
+                  {!avatarError ? (
+                    <img
+                      src={TEACHER_PROFILE.avatarUrl}
+                      alt={displayTeacherName}
+                      referrerPolicy="no-referrer"
+                      onError={() => setAvatarError(true)}
+                      className="w-11 h-11 rounded-full object-cover border border-slate-200 shrink-0"
+                    />
+                  ) : (
+                    <div className="w-11 h-11 rounded-full bg-slate-800 text-white flex items-center justify-center font-semibold text-sm shrink-0">
+                      ЕС
+                    </div>
+                  )}
+                  <div className="min-w-0">
+                    <h2 className="text-sm font-semibold text-slate-900 truncate">
+                      {displayTeacherName}
+                    </h2>
+                    <p className="text-xs text-slate-500 truncate">
+                      {displayTeacherSchool}
+                    </p>
+                    <div className="flex items-center gap-2 text-xs text-slate-600 mt-1 font-mono-tabular">
+                      <span>К проверке: {pendingCount}</span>
+                      <span aria-hidden="true">·</span>
+                      <span>Готово: {checkedCount}</span>
+                    </div>
                   </div>
                 </div>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('cabinet')}
+                  className="w-full py-1.5 px-3 text-xs font-medium text-sky-800 bg-sky-50/80 hover:bg-sky-100/80 border border-sky-200/80 rounded-lg transition-colors text-center cursor-pointer"
+                >
+                  {teacherProfile
+                    ? `Личный кабинет и мои классы (${classes.length}) →`
+                    : 'Регистрация учителя по номеру телефона →'}
+                </button>
               </div>
 
               {/* Stack Filter & Queue List */}
@@ -502,6 +975,23 @@ export default function App() {
                     aria-label="Поиск тетради по фамилии ученика или классу"
                     className="w-full pl-8 pr-3 py-1.5 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-600"
                   />
+                </div>
+
+                {/* Class Dropdown Filter */}
+                <div>
+                  <select
+                    aria-label="Фильтр по классу учителя"
+                    value={classFilter}
+                    onChange={(e) => setClassFilter(e.target.value)}
+                    className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded-lg bg-slate-50 text-slate-800 font-medium"
+                  >
+                    <option value="all">Все мои классы ({classes.length})</option>
+                    {classes.map((cls) => (
+                      <option key={cls.id} value={cls.name}>
+                        {cls.name} ({cls.studentCount} уч.)
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
                 {/* Status Segmented Filter */}
@@ -588,6 +1078,7 @@ export default function App() {
                         onClick={() => {
                           setStatusFilter('all');
                           setSubjectFilter('all');
+                          setClassFilter('all');
                           setSearchQuery('');
                         }}
                         className="text-sky-700 font-medium hover:underline"
@@ -692,7 +1183,8 @@ export default function App() {
                     <span>Сдано: {currentSubmission.submittedDate}</span>
                   </div>
                   <h1 className="text-lg font-semibold text-slate-900">
-                    {currentSubmission.studentName} — {currentSubmission.assignmentTitle}
+                    {currentSubmission.studentName} —{' '}
+                    {currentSubmission.assignmentTitle}
                   </h1>
                 </div>
 
@@ -826,6 +1318,7 @@ export default function App() {
                 onToggleLineMark={handleToggleLineMark}
                 onChangePaperRuling={handleChangePaperRuling}
                 onOpenPhotoScanner={() => setIsPhotoModalOpen(true)}
+                onUpdateAndReanalyzeLines={handleUpdateAndReanalyzeLines}
               />
             </section>
 
@@ -1006,7 +1499,7 @@ export default function App() {
             <div className="flex flex-wrap items-end justify-between gap-4 bg-white p-6 border border-slate-200 rounded-xl">
               <div className="space-y-1">
                 <div className="text-xs text-slate-500">
-                  Сводная ведомость проверки домашних тетрадей · 6 октября
+                  Сводная ведомость проверки домашних тетрадей · {displayTeacherName}
                 </div>
                 <h1 className="text-2xl font-semibold text-slate-900">
                   Журнал проверки тетрадей и типичные ошибки класса
@@ -1043,40 +1536,56 @@ export default function App() {
                 <h2 className="text-sm font-semibold text-slate-900">
                   Ведомость выставленных отметок (Содержание / Каллиграфия)
                 </h2>
-                <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
-                  <button
-                    type="button"
-                    onClick={() => setSubjectFilter('all')}
-                    className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-                      subjectFilter === 'all'
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600'
-                    }`}
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    aria-label="Выбор класса в журнале"
+                    value={classFilter}
+                    onChange={(e) => setClassFilter(e.target.value)}
+                    className="px-3 py-1 text-xs border border-slate-200 rounded-lg bg-slate-50 font-medium"
                   >
-                    Все предметы
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSubjectFilter('Русский язык')}
-                    className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-                      subjectFilter === 'Русский язык'
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600'
-                    }`}
-                  >
-                    Русский язык
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSubjectFilter('Математика')}
-                    className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-                      subjectFilter === 'Математика'
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600'
-                    }`}
-                  >
-                    Математика
-                  </button>
+                    <option value="all">Все классы ({classes.length})</option>
+                    {classes.map((cls) => (
+                      <option key={cls.id} value={cls.name}>
+                        {cls.name}
+                      </option>
+                    ))}
+                  </select>
+
+                  <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                    <button
+                      type="button"
+                      onClick={() => setSubjectFilter('all')}
+                      className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+                        subjectFilter === 'all'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600'
+                      }`}
+                    >
+                      Все предметы
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSubjectFilter('Русский язык')}
+                      className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+                        subjectFilter === 'Русский язык'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600'
+                      }`}
+                    >
+                      Русский язык
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSubjectFilter('Математика')}
+                      className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+                        subjectFilter === 'Математика'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600'
+                      }`}
+                    >
+                      Математика
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -1252,20 +1761,22 @@ export default function App() {
                           <p className="text-xs font-semibold text-sky-800">
                             {customAiCard.encouragement}
                           </p>
-                          {(customAiCard.steps || []).map((st: any, idx: number) => (
-                            <div
-                              key={idx}
-                              className="p-3 rounded-lg bg-[#FFFEF9] border border-slate-200 text-xs space-y-1"
-                            >
-                              <div className="font-semibold text-slate-900">
-                                {st.ruleReminder}
+                          {(customAiCard.steps || []).map(
+                            (st: any, idx: number) => (
+                              <div
+                                key={idx}
+                                className="p-3 rounded-lg bg-[#FFFEF9] border border-slate-200 text-xs space-y-1"
+                              >
+                                <div className="font-semibold text-slate-900">
+                                  {st.ruleReminder}
+                                </div>
+                                <p className="text-slate-600">{st.taskText}</p>
+                                <div className="font-handwriting text-lg text-[#1E3A8A] pt-1">
+                                  {(st.practiceItems || []).join('   ·   ')}
+                                </div>
                               </div>
-                              <p className="text-slate-600">{st.taskText}</p>
-                              <div className="font-handwriting text-lg text-[#1E3A8A] pt-1">
-                                {(st.practiceItems || []).join('   ·   ')}
-                              </div>
-                            </div>
-                          ))}
+                            )
+                          )}
                         </div>
                       ) : (
                         <div className="space-y-2 pt-2">
@@ -1350,7 +1861,9 @@ export default function App() {
             <div className="p-6 bg-white border border-slate-200 rounded-xl space-y-3">
               <h2 className="text-base font-semibold text-slate-900 flex items-center gap-2">
                 <BookOpen className="w-4 h-4 text-red-600" />
-                <span>Единый орфографический режим ведения тетрадей (1–4 класс)</span>
+                <span>
+                  Единый орфографический режим ведения тетрадей (1–4 класс)
+                </span>
               </h2>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-xs text-slate-700">
                 <div className="space-y-1">
@@ -1400,6 +1913,12 @@ export default function App() {
         isOpen={isPhotoModalOpen}
         onClose={() => setIsPhotoModalOpen(false)}
         onAddCheckedSubmission={handleAddCheckedSubmission}
+        classes={classes}
+        activeClassGroup={
+          classFilter !== 'all' ? classFilter : currentSubmission?.classGroup
+        }
+        activeStudentName={currentSubmission?.studentName}
+        activeSubject={currentSubmission?.subject}
       />
     </div>
   );

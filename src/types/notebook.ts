@@ -64,3 +64,25 @@ export interface FgosNormItem {
   mathCriteria: string;
   calligraphyCriteria: string;
 }
+
+export interface TeacherProfileData {
+  ownerId: string;
+  fullName: string;
+  phone: string;
+  schoolName: string;
+  qualification: string;
+  avatarUrl?: string;
+  isPhoneVerified?: boolean;
+  isCloudSynced?: boolean;
+}
+
+export interface SchoolClassItem {
+  id: string;
+  ownerId: string;
+  name: string; // e.g. "2 «А» класс"
+  gradeLevel: number; // 1, 2, 3, 4
+  academicYear: string; // e.g. "2026/2027"
+  defaultRuling: PaperRulingType;
+  studentCount: number;
+  studentsList: string; // newline-separated student names
+}
