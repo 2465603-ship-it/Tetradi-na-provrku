@@ -9,12 +9,20 @@ dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
 
+interface ModelEnvironmentConfig {
+  primaryModel: string;
+  modelsToTry: string[];
+  temperature?: number;
+  thinkingLevel?: ThinkingLevel;
+  maxOutputTokens?: number;
+}
+
 function getCandidateApiKeys(): string[] {
+  // Exclusively load API keys from server-side environment variables
   const candidates = [
-    process.env.API_KEY,
     process.env.GEMINI_API_KEY,
+    process.env.API_KEY,
     process.env.GOOGLE_API_KEY,
-    process.env.VITE_GEMINI_API_KEY,
   ];
   const unique: string[] = [];
   for (const key of candidates) {
@@ -29,6 +37,69 @@ function getCandidateApiKeys(): string[] {
     }
   }
   return unique;
+}
+
+function getModelConfig(): ModelEnvironmentConfig {
+  // Model settings configured via environment variables
+  const primaryModel = process.env.GEMINI_MODEL?.trim() || 'gemini-3.8-flash';
+  const fallbackEnv = process.env.GEMINI_FALLBACK_MODELS?.trim();
+
+  let modelsToTry: string[];
+  if (fallbackEnv) {
+    modelsToTry = fallbackEnv
+      .split(',')
+      .map((m) => m.trim())
+      .filter(Boolean);
+  } else {
+    modelsToTry = [
+      primaryModel,
+      'gemini-3.1-pro-preview',
+      'gemini-flash-latest',
+      'gemini-3.1-flash-lite',
+    ];
+  }
+
+  if (!modelsToTry.includes(primaryModel)) {
+    modelsToTry.unshift(primaryModel);
+  }
+  modelsToTry = Array.from(new Set(modelsToTry));
+
+  const parsedTemp = process.env.GEMINI_TEMPERATURE
+    ? parseFloat(process.env.GEMINI_TEMPERATURE)
+    : undefined;
+  const temperature =
+    parsedTemp !== undefined && !isNaN(parsedTemp) ? parsedTemp : undefined;
+
+  const parsedMaxTokens = process.env.GEMINI_MAX_OUTPUT_TOKENS
+    ? parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS, 10)
+    : undefined;
+  const maxOutputTokens =
+    parsedMaxTokens !== undefined && !isNaN(parsedMaxTokens)
+      ? parsedMaxTokens
+      : undefined;
+
+  // GEMINI_THINKING_LEVEL: LOW | HIGH | OFF
+  const envThinking = process.env.GEMINI_THINKING_LEVEL?.toUpperCase()?.trim();
+  let thinkingLevel: ThinkingLevel | undefined;
+  if (envThinking === 'LOW') {
+    thinkingLevel = ThinkingLevel.LOW;
+  } else if (envThinking === 'HIGH') {
+    thinkingLevel = ThinkingLevel.HIGH;
+  } else if (envThinking === 'OFF') {
+    thinkingLevel = undefined;
+  } else if (!envThinking) {
+    thinkingLevel = primaryModel.includes('3.8-flash')
+      ? ThinkingLevel.LOW
+      : undefined;
+  }
+
+  return {
+    primaryModel,
+    modelsToTry,
+    temperature,
+    thinkingLevel,
+    maxOutputTokens,
+  };
 }
 
 // Helper to resolve image bytes if teacher selected a built-in sample photo URL
@@ -83,17 +154,11 @@ async function callGeminiMultimodalWithFallback(
   const apiKeys = getCandidateApiKeys();
   if (apiKeys.length === 0) {
     throw new Error(
-      'На сервере опубликованного приложения не найден действующий GEMINI_API_KEY.'
+      'На сервере опубликованного приложения не найден действующий GEMINI_API_KEY. Задайте переменную окружения GEMINI_API_KEY.'
     );
   }
 
-  const modelsToTry = [
-    'gemini-3.8-flash',
-    'gemini-3.1-pro-preview',
-    'gemini-flash-latest',
-    'gemini-3.1-flash-lite',
-  ];
-
+  const modelConfig = getModelConfig();
   let lastError: any = null;
 
   for (const apiKey of apiKeys) {
@@ -106,15 +171,28 @@ async function callGeminiMultimodalWithFallback(
       },
     });
 
-    for (const modelName of modelsToTry) {
+    for (const modelName of modelConfig.modelsToTry) {
       try {
         const config: any = {
           systemInstruction,
           responseMimeType: 'application/json',
           responseSchema,
         };
-        if (modelName === 'gemini-3.8-flash') {
-          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+
+        if (modelConfig.temperature !== undefined) {
+          config.temperature = modelConfig.temperature;
+        }
+
+        if (modelConfig.maxOutputTokens !== undefined) {
+          config.maxOutputTokens = modelConfig.maxOutputTokens;
+        }
+
+        // Apply thinking config from env or model defaults
+        if (
+          modelConfig.thinkingLevel !== undefined &&
+          (modelName.includes('3.8-flash') || modelName.includes('pro'))
+        ) {
+          config.thinkingConfig = { thinkingLevel: modelConfig.thinkingLevel };
         }
 
         const response = await ai.models.generateContent({
@@ -513,14 +591,20 @@ async function startServer() {
   // Health check endpoint for deployment probes
   app.get('/api/health', (_req, res) => {
     const keys = getCandidateApiKeys();
+    const modelConfig = getModelConfig();
     res.status(200).json({
       status: 'ok',
       hasApiKey: keys.length > 0,
+      activeModel: modelConfig.primaryModel,
+      fallbackModels: modelConfig.modelsToTry,
+      temperature: modelConfig.temperature,
+      thinkingLevel: modelConfig.thinkingLevel,
     });
   });
 
   // In-memory store for phone OTP verification codes
   const otpStore = new Map<string, { code: string; expiresAt: number }>();
+  const defaultDemoOtp = process.env.DEMO_OTP_CODE || '4825';
 
   app.post('/api/auth/send-otp', (req, res) => {
     const { phone } = req.body || {};
@@ -534,7 +618,7 @@ async function startServer() {
       });
     }
     const normalizedPhone = phone.replace(/\D/g, '');
-    const code = '4825';
+    const code = defaultDemoOtp;
     otpStore.set(normalizedPhone, {
       code,
       expiresAt: Date.now() + 10 * 60 * 1000,
@@ -555,10 +639,10 @@ async function startServer() {
 
     if (
       !cleanCode ||
-      (stored && stored.code !== cleanCode && cleanCode !== '4825')
+      (stored && stored.code !== cleanCode && cleanCode !== defaultDemoOtp)
     ) {
       return res.status(400).json({
-        error: 'Неверный код из СМС. Проверьте введённые 4 цифры (код: 4825).',
+        error: `Неверный код из СМС. Проверьте введённые 4 цифры (код: ${defaultDemoOtp}).`,
       });
     }
 
