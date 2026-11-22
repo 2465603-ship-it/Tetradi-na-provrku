@@ -113,12 +113,10 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
   const defaultClassName =
     activeClassGroup && activeClassGroup !== 'all'
       ? activeClassGroup
-      : classes[0]?.name || '2 «А» класс';
+      : classes[0]?.name || '';
 
   const [classGroup, setClassGroup] = useState(defaultClassName);
-  const [studentName, setStudentName] = useState(
-    activeStudentName || 'Соколов Артём'
-  );
+  const [studentName, setStudentName] = useState(activeStudentName || '');
   const [subject, setSubject] = useState<SubjectType>(
     activeSubject || 'Русский язык'
   );
@@ -293,7 +291,7 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
         activeClassGroup !== 'all' &&
         classes.some((c) => c.name === activeClassGroup)
           ? activeClassGroup
-          : classes[0]?.name || '2 «А» класс';
+          : classes[0]?.name || '';
 
       setClassGroup(targetClass);
 
@@ -309,8 +307,8 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
         setStudentName(activeStudentName);
       } else if (roster.length > 0) {
         setStudentName(roster[0]);
-      } else if (activeStudentName) {
-        setStudentName(activeStudentName);
+      } else {
+        setStudentName(activeStudentName || '');
       }
 
       if (activeSubject) {
@@ -661,8 +659,16 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
   const handleSaveToQueue = () => {
     if (!analysisResult) return;
 
+    const cleanStudentName = studentName.trim();
+    if (!cleanStudentName) {
+      setErrorMsg('Укажите фамилию и имя ученика перед сохранением тетради.');
+      return;
+    }
+
+    const cleanClassGroup = classGroup.trim() || 'Мой класс';
+
     const isFirstGrade =
-      selectedClassObj?.gradeLevel === 1 || classGroup.startsWith('1');
+      selectedClassObj?.gradeLevel === 1 || cleanClassGroup.startsWith('1');
     const defaultRuling =
       subject === 'Математика'
         ? 'squared-grid'
@@ -675,8 +681,8 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
 
     const newSubmission: NotebookSubmission = {
       id: `sub-${Date.now()}`,
-      studentName: studentName.trim() || 'Ученик класса',
-      classGroup,
+      studentName: cleanStudentName,
+      classGroup: cleanClassGroup,
       subject,
       paperRuling: defaultRuling,
       assignmentTitle,
@@ -781,18 +787,29 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
                   >
                     1. Ваш класс
                   </label>
-                  <select
-                    id="modal-class-group"
-                    value={classGroup}
-                    onChange={(e) => handleClassChange(e.target.value)}
-                    className="w-full px-2.5 py-2 text-xs font-medium border border-slate-300 rounded-lg bg-white"
-                  >
-                    {classes.map((cls) => (
-                      <option key={cls.id} value={cls.name}>
-                        {cls.name} ({cls.gradeLevel} кл.)
-                      </option>
-                    ))}
-                  </select>
+                  {classes.length > 0 ? (
+                    <select
+                      id="modal-class-group"
+                      value={classGroup}
+                      onChange={(e) => handleClassChange(e.target.value)}
+                      className="w-full px-2.5 py-2 text-xs font-medium border border-slate-300 rounded-lg bg-white"
+                    >
+                      {classes.map((cls) => (
+                        <option key={cls.id} value={cls.name}>
+                          {cls.name} ({cls.gradeLevel} кл.)
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      id="modal-class-group"
+                      type="text"
+                      value={classGroup}
+                      onChange={(e) => setClassGroup(e.target.value)}
+                      placeholder="Например: 2 «А» класс"
+                      className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg bg-white"
+                    />
+                  )}
                 </div>
 
                 <div>

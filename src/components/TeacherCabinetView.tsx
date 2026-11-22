@@ -4,6 +4,7 @@ import {
   SchoolClassItem,
   PaperRulingType,
   SubjectType,
+  ParentContact,
 } from '../types/notebook';
 import { safeParseJsonResponse } from '../utils/api';
 import {
@@ -13,6 +14,7 @@ import {
   FilePlus2,
   HelpCircle,
   LogOut,
+  Mail,
   Phone,
   Plus,
   School,
@@ -45,6 +47,8 @@ interface TeacherCabinetViewProps {
     classItem: SchoolClassItem,
     subject: SubjectType
   ) => void;
+  parentContacts?: Record<string, ParentContact>;
+  onSaveParentContact?: (studentName: string, contact: ParentContact) => void;
   onConnectGoogleCloud: () => Promise<void>;
   onLogout: () => Promise<void>;
 }
@@ -85,6 +89,8 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
   onUpdateClass,
   onDeleteClass,
   onCreateNotebookForStudent,
+  parentContacts = {},
+  onSaveParentContact,
   onConnectGoogleCloud,
   onLogout,
 }) => {
@@ -122,9 +128,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
   const [newClassYear, setNewClassYear] = useState('2026/2027');
   const [newClassRuling, setNewClassRuling] =
     useState<PaperRulingType>('lined-slanted');
-  const [newClassStudents, setNewClassStudents] = useState(
-    'Абрамова Полина\nВолков Тимофей\nГромова Алиса\nЗайцев Матвей'
-  );
+  const [newClassStudents, setNewClassStudents] = useState('');
 
   // Quick student addition inside an existing class
   const [addingStudentToClassId, setAddingStudentToClassId] = useState<
@@ -133,6 +137,12 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
   const [newStudentName, setNewStudentName] = useState('');
   const [selectedSubjectForNewNotebook, setSelectedSubjectForNewNotebook] =
     useState<SubjectType>('Русский язык');
+
+  // Inline parent contact editor for a student in the class roster
+  const [editingParentKey, setEditingParentKey] = useState<string | null>(null);
+  const [draftParentFullName, setDraftParentFullName] = useState('');
+  const [draftParentEmail, setDraftParentEmail] = useState('');
+  const [parentFormError, setParentFormError] = useState<string | null>(null);
 
   // Step 1: Request SMS code
   const handleSendOtp = async (e: React.FormEvent) => {
@@ -205,9 +215,8 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
               academicYear: '2026/2027',
               defaultRuling:
                 firstClassGrade <= 2 ? 'lined-slanted' : 'lined-wide',
-              studentCount: 3,
-              studentsList:
-                'Соколов Артём\nМорозов Даниил\nКозлова Вероника',
+              studentCount: 0,
+              studentsList: '',
             }
           : undefined;
 
@@ -847,7 +856,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
               rows={4}
               value={newClassStudents}
               onChange={(e) => setNewClassStudents(e.target.value)}
-              placeholder="Иванов Александр&#10;Петрова Мария&#10;Сидоров Максим"
+              placeholder="Введите ФИО каждого ученика с новой строки..."
               className="w-full p-3 text-xs border border-slate-300 rounded-lg font-sans"
             />
           </div>
@@ -897,6 +906,27 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
       </div>
 
       {/* Grid of Teacher's Created Classes */}
+      {classes.length === 0 ? (
+        <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-3">
+          <Users className="w-8 h-8 text-slate-400 mx-auto" />
+          <div className="space-y-1">
+            <h3 className="text-sm font-semibold text-slate-900">
+              Классы и ученики ещё не добавлены
+            </h3>
+            <p className="text-xs text-slate-500 max-w-md mx-auto">
+              Нажмите «Создать свой класс», чтобы добавить класс и вручную завести список ваших учеников.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setIsCreatingClass(true)}
+            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Создать первый класс</span>
+          </button>
+        </div>
+      ) : (
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {classes.map((cls) => {
           const students = cls.studentsList
@@ -995,34 +1025,155 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                       В классе пока нет учеников. Нажмите «+ Добавить ученика».
                     </p>
                   ) : (
-                    <div className="divide-y divide-slate-100 border border-slate-200 rounded-lg max-h-56 overflow-y-auto">
-                      {students.map((stuName, idx) => (
-                        <div
-                          key={idx}
-                          className="px-3 py-2 flex items-center justify-between gap-2 text-xs hover:bg-slate-50"
-                        >
-                          <span className="font-medium text-slate-800">
-                            <span className="font-mono-tabular text-slate-400 mr-2">
-                              {idx + 1}.
-                            </span>
-                            {stuName}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              onCreateNotebookForStudent(
-                                stuName,
-                                cls,
-                                selectedSubjectForNewNotebook
-                              )
-                            }
-                            className="flex items-center gap-1 text-sky-700 hover:text-sky-900 font-semibold whitespace-nowrap cursor-pointer"
-                          >
-                            <FilePlus2 className="w-3.5 h-3.5" />
-                            <span>Открыть тетрадь ({selectedSubjectForNewNotebook})</span>
-                          </button>
-                        </div>
-                      ))}
+                    <div className="divide-y divide-slate-100 border border-slate-200 rounded-lg max-h-72 overflow-y-auto">
+                      {students.map((stuName, idx) => {
+                        const rowKey = `${cls.id}:${stuName}`;
+                        const existingContact = parentContacts[stuName];
+                        const isEditingParent = editingParentKey === rowKey;
+
+                        return (
+                          <div key={idx} className="px-3 py-2 text-xs hover:bg-slate-50/70">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <span className="font-medium text-slate-800">
+                                  <span className="font-mono-tabular text-slate-400 mr-2">
+                                    {idx + 1}.
+                                  </span>
+                                  {stuName}
+                                </span>
+                                {existingContact &&
+                                  (existingContact.parentFullName ||
+                                    existingContact.parentEmail) && (
+                                    <div className="text-[11px] text-slate-500 pl-5 truncate">
+                                      Родитель:{' '}
+                                      {existingContact.parentFullName || 'не указано'}
+                                      {existingContact.parentEmail
+                                        ? ` · ${existingContact.parentEmail}`
+                                        : ''}
+                                    </div>
+                                  )}
+                              </div>
+
+                              <div className="flex items-center gap-3 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (isEditingParent) {
+                                      setEditingParentKey(null);
+                                      setParentFormError(null);
+                                    } else {
+                                      setEditingParentKey(rowKey);
+                                      setDraftParentFullName(
+                                        existingContact?.parentFullName || ''
+                                      );
+                                      setDraftParentEmail(
+                                        existingContact?.parentEmail || ''
+                                      );
+                                      setParentFormError(null);
+                                    }
+                                  }}
+                                  className="flex items-center gap-1 text-slate-600 hover:text-slate-900 font-medium whitespace-nowrap cursor-pointer"
+                                >
+                                  <Mail className="w-3 h-3" />
+                                  <span>
+                                    {existingContact?.parentEmail
+                                      ? 'Контакты'
+                                      : '+ Родитель'}
+                                  </span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    onCreateNotebookForStudent(
+                                      stuName,
+                                      cls,
+                                      selectedSubjectForNewNotebook
+                                    )
+                                  }
+                                  className="flex items-center gap-1 text-sky-700 hover:text-sky-900 font-semibold whitespace-nowrap cursor-pointer"
+                                >
+                                  <FilePlus2 className="w-3.5 h-3.5" />
+                                  <span>
+                                    Открыть тетрадь ({selectedSubjectForNewNotebook})
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+
+                            {isEditingParent && (
+                              <form
+                                onSubmit={(e) => {
+                                  e.preventDefault();
+                                  const cleanName = draftParentFullName.trim();
+                                  const cleanEmail = draftParentEmail.trim();
+                                  if (
+                                    cleanEmail &&
+                                    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)
+                                  ) {
+                                    setParentFormError(
+                                      'Введите корректный E-mail родителя.'
+                                    );
+                                    return;
+                                  }
+                                  onSaveParentContact?.(stuName, {
+                                    parentFullName: cleanName,
+                                    parentEmail: cleanEmail,
+                                  });
+                                  setEditingParentKey(null);
+                                  setParentFormError(null);
+                                }}
+                                className="mt-2 p-2.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2"
+                              >
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                  <input
+                                    type="text"
+                                    value={draftParentFullName}
+                                    onChange={(e) =>
+                                      setDraftParentFullName(e.target.value)
+                                    }
+                                    placeholder="ФИО родителя"
+                                    aria-label={`ФИО родителя для ${stuName}`}
+                                    className="px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-600"
+                                  />
+                                  <input
+                                    type="email"
+                                    value={draftParentEmail}
+                                    onChange={(e) =>
+                                      setDraftParentEmail(e.target.value)
+                                    }
+                                    placeholder="E-mail родителя"
+                                    aria-label={`E-mail родителя для ${stuName}`}
+                                    className="px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-600"
+                                  />
+                                </div>
+                                {parentFormError && (
+                                  <p className="text-[11px] text-red-600">
+                                    {parentFormError}
+                                  </p>
+                                )}
+                                <div className="flex items-center justify-end gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setEditingParentKey(null);
+                                      setParentFormError(null);
+                                    }}
+                                    className="px-2 py-1 text-[11px] text-slate-600 hover:text-slate-900 cursor-pointer"
+                                  >
+                                    Отмена
+                                  </button>
+                                  <button
+                                    type="submit"
+                                    className="px-2.5 py-1 text-[11px] font-semibold bg-slate-900 text-white rounded-md hover:bg-slate-800 cursor-pointer"
+                                  >
+                                    Сохранить
+                                  </button>
+                                </div>
+                              </form>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -1031,6 +1182,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
           );
         })}
       </div>
+      )}
     </div>
   );
 };

@@ -4,6 +4,14 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import { createWorker } from 'tesseract.js';
+import {
+  generateNotebookReportPdf,
+  sendParentReportEmail,
+  sendParentReportViaGmail,
+  isSmtpConfigured,
+  isValidEmail,
+  type NotebookReportPayload,
+} from './utils/reportMailer.ts';
 
 dotenv.config({ path: '.env.local' });
 dotenv.config();
@@ -777,6 +785,8 @@ async function startServer() {
       status: 'ok',
       hasApiKey: keys.length > 0,
       hasFirebaseAuthKey: Boolean(getFirebaseWebApiKey()),
+      hasSmtpConfig: isSmtpConfigured(),
+      supportsGmailOAuth: true,
       activeModel: modelConfig.primaryModel,
       fallbackModels: modelConfig.modelsToTry,
       temperature: modelConfig.temperature,
@@ -1471,6 +1481,121 @@ ${
         error:
           error?.message ||
           'Не удалось выполнить графологическую сверку почерка. Проверьте чёткость изображений и наличие GEMINI_API_KEY.',
+      });
+    }
+  });
+
+  // Endpoint 4: Generate downloadable PDF report for a checked notebook (Protected by Firebase Auth)
+  app.post('/api/report-pdf', requireFirebaseAuth, async (req, res) => {
+    try {
+      const rawReport = req.body?.report || req.body;
+      if (!rawReport || typeof rawReport !== 'object' || Array.isArray(rawReport)) {
+        return res.status(400).json({
+          error: 'Передайте данные проверки тетради для формирования PDF-отчёта.',
+        });
+      }
+
+      const report: NotebookReportPayload = {
+        ...rawReport,
+        studentName:
+          typeof rawReport.studentName === 'string' && rawReport.studentName.trim()
+            ? rawReport.studentName.trim()
+            : 'Ученик',
+        errors: Array.isArray(rawReport.errors) ? rawReport.errors : [],
+      };
+
+      const pdfBuffer = await generateNotebookReportPdf(report);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', 'attachment; filename="notebook-report.pdf"');
+      res.setHeader('Content-Length', String(pdfBuffer.length));
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(200).end(pdfBuffer);
+    } catch (error: any) {
+      console.error('Error in /api/report-pdf:', error);
+      return res.status(500).json({
+        error: error?.message || 'Не удалось сформировать PDF-отчёт.',
+      });
+    }
+  });
+
+  // Endpoint 5: Generate PDF report and send to parent via Gmail API or SMTP (Protected by Firebase Auth)
+  app.post('/api/send-parent-report', requireFirebaseAuth, async (req, res) => {
+    try {
+      const { recipientEmail, parentName, report } = req.body || {};
+      const cleanEmail = typeof recipientEmail === 'string' ? recipientEmail.trim() : '';
+
+      if (!isValidEmail(cleanEmail)) {
+        return res.status(400).json({
+          error: 'Укажите корректный Email получателя (родителя).',
+        });
+      }
+
+      if (!report || typeof report.studentName !== 'string' || !report.studentName.trim()) {
+        return res.status(400).json({
+          error: 'Отсутствуют данные проверки тетради для формирования отчёта.',
+        });
+      }
+
+      const rawGmailHeader = req.header('x-gmail-access-token') || '';
+      const gmailAccessToken = rawGmailHeader.replace(/^Bearer\s+/i, '').trim();
+
+      if (gmailAccessToken) {
+        const result = await sendParentReportViaGmail({
+          gmailAccessToken,
+          recipientEmail: cleanEmail,
+          parentName: typeof parentName === 'string' ? parentName.trim() : '',
+          report: report as NotebookReportPayload,
+        });
+
+        return res.json({
+          sent: true,
+          provider: 'gmail',
+          recipientEmail: cleanEmail,
+          messageId: result.messageId,
+          pdfBytes: result.pdfBytes,
+          message: `PDF-отчёт успешно отправлен через Gmail на ${cleanEmail}.`,
+        });
+      }
+
+      if (!isSmtpConfigured()) {
+        return res.status(503).json({
+          error:
+            'Подключите аккаунт Google (Gmail) кнопкой в этом окне, чтобы отправить PDF-отчёт родителю без настройки SMTP-сервера.',
+          needsGmailAuth: true,
+        });
+      }
+
+      const result = await sendParentReportEmail({
+        recipientEmail: cleanEmail,
+        parentName: typeof parentName === 'string' ? parentName.trim() : '',
+        report: report as NotebookReportPayload,
+      });
+
+      return res.json({
+        sent: true,
+        provider: 'smtp',
+        recipientEmail: cleanEmail,
+        messageId: result.messageId,
+        pdfBytes: result.pdfBytes,
+        message: `PDF-отчёт успешно отправлен на ${cleanEmail}.`,
+      });
+    } catch (error: any) {
+      console.error('Error in /api/send-parent-report:', error);
+      if (error?.requiresGmailAuth) {
+        return res.status(403).json({
+          error:
+            error?.message ||
+            'Доступ к отправке писем через Gmail истёк. Подключите Google-аккаунт заново.',
+          requiresGmailAuth: true,
+        });
+      }
+      const status =
+        typeof error?.statusCode === 'number' ? error.statusCode : 500;
+      return res.status(status).json({
+        error:
+          error?.message ||
+          'Не удалось отправить отчёт на электронную почту родителя.',
+        needsGmailAuth: Boolean(error?.needsGmailAuth),
       });
     }
   });

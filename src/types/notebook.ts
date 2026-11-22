@@ -43,6 +43,11 @@ export interface HandwritingVerificationResult {
   checkedAt?: string;
 }
 
+export interface ParentContact {
+  parentFullName: string;
+  parentEmail: string;
+}
+
 export interface NotebookSubmission {
   id: string;
   studentName: string;
@@ -60,6 +65,8 @@ export interface NotebookSubmission {
   photoSampleUrl: string;
   teacherSummary: string;
   parentMessage: string;
+  parentFullName?: string;
+  parentEmail?: string;
   errors: NotebookError[];
   customLineMarks: CustomLineMark[];
   remediationTasks: RemediationTask[];

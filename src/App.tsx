@@ -9,6 +9,7 @@ import {
   TeacherProfileData,
   SchoolClassItem,
   AuthSession,
+  ParentContact,
 } from './types/notebook';
 import {
   INITIAL_SUBMISSIONS,
@@ -24,6 +25,7 @@ import { AuthSidebar } from './components/AuthSidebar';
 import { safeParseJsonResponse } from './utils/api';
 import {
   auth,
+  clearGmailAccessToken,
   fetchTeacherProfileFromFirestore,
   upsertTeacherProfileInFirestore,
   createClassInFirestore,
@@ -51,52 +53,53 @@ import {
   UserCircle2,
   ShieldCheck,
   ShieldAlert,
+  Mail,
+  Download,
+  X,
+  AlertCircle,
 } from 'lucide-react';
 
 type ActiveTab = 'desk' | 'journal' | 'remediation' | 'norms' | 'cabinet';
 
-const DEFAULT_CLASSES: SchoolClassItem[] = [
-  {
-    id: 'cls_2a',
-    ownerId: 'default_teacher',
-    name: '2 «А» класс',
-    gradeLevel: 2,
-    academicYear: '2026/2027',
-    defaultRuling: 'lined-slanted',
-    studentCount: 3,
-    studentsList: 'Соколов Артём\nМорозов Даниил\nКозлов Илья',
-  },
-  {
-    id: 'cls_3b',
-    ownerId: 'default_teacher',
-    name: '3 «Б» класс',
-    gradeLevel: 3,
-    academicYear: '2026/2027',
-    defaultRuling: 'squared-grid',
-    studentCount: 2,
-    studentsList: 'Белова Мария\nКузнецова София',
-  },
-  {
-    id: 'cls_1v',
-    ownerId: 'default_teacher',
-    name: '1 «В» класс',
-    gradeLevel: 1,
-    academicYear: '2026/2027',
-    defaultRuling: 'lined-slanted',
-    studentCount: 1,
-    studentsList: 'Лебедев Максим',
-  },
-];
+function isLegacyFakeSeedClass(cls: SchoolClassItem): boolean {
+  if (cls.ownerId !== 'default_teacher') return false;
+  if (
+    cls.id === 'cls_2a' &&
+    cls.studentsList === 'Соколов Артём\nМорозов Даниил\nКозлов Илья'
+  ) {
+    return true;
+  }
+  if (
+    cls.id === 'cls_3b' &&
+    cls.studentsList === 'Белова Мария\nКузнецова София'
+  ) {
+    return true;
+  }
+  if (cls.id === 'cls_1v' && cls.studentsList === 'Лебедев Максим') {
+    return true;
+  }
+  return false;
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('desk');
-  const [submissions, setSubmissions] =
-    useState<NotebookSubmission[]>(INITIAL_SUBMISSIONS);
+  const [submissions, setSubmissions] = useState<NotebookSubmission[]>(() => {
+    try {
+      const saved = localStorage.getItem('tetrad_plus_submissions');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return INITIAL_SUBMISSIONS;
+  });
   const [selectedSubmissionId, setSelectedSubmissionId] = useState<string>(
-    INITIAL_SUBMISSIONS[0].id
+    () => submissions[0]?.id || ''
   );
   const [selectedErrorId, setSelectedErrorId] = useState<string | null>(
-    INITIAL_SUBMISSIONS[0].errors[0]?.id || null
+    () => submissions[0]?.errors[0]?.id || null
   );
 
   // Teacher Profile & Classes State
@@ -117,15 +120,28 @@ export default function App() {
       const saved = localStorage.getItem('tetrad_plus_teacher_classes');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed)) {
+          return parsed.filter((cls) => !isLegacyFakeSeedClass(cls));
+        }
       }
     } catch {
       // ignore storage errors
     }
-    return DEFAULT_CLASSES;
+    return [];
   });
 
-  // Persist local cabinet changes
+  // Persist local cabinet changes and teacher-created notebook submissions
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'tetrad_plus_submissions',
+        JSON.stringify(submissions)
+      );
+    } catch {
+      // ignore
+    }
+  }, [submissions]);
+
   useEffect(() => {
     try {
       if (teacherProfile) {
@@ -262,12 +278,34 @@ export default function App() {
         } catch (err) {
           console.warn('Firestore profile sync skipped:', err);
         }
+      } else {
+        clearGmailAccessToken();
+        setGmailAccessToken(null);
+        setGmailSenderEmail(null);
       }
     });
 
     return () => {
       unsubscribeAuth();
       if (unsubscribeClasses) unsubscribeClasses();
+    };
+  }, []);
+
+  // Check server email capability (SMTP vs Gmail OAuth) on startup
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/health')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!cancelled && data) {
+          setServerHasSmtp(Boolean(data.hasSmtpConfig));
+        }
+      })
+      .catch(() => {
+        // Ignore transient health check failure
+      });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -284,6 +322,67 @@ export default function App() {
   const [copiedParentFeedback, setCopiedParentFeedback] = useState(false);
   const [approvalBanner, setApprovalBanner] = useState<string | null>(null);
   const [avatarError, setAvatarError] = useState(false);
+
+  // Parent PDF & Email report state + saved parent contacts per student
+  const [isParentReportModalOpen, setIsParentReportModalOpen] = useState(false);
+  const [reportTargetSubmission, setReportTargetSubmission] =
+    useState<NotebookSubmission | null>(null);
+  const [parentEmailInput, setParentEmailInput] = useState('');
+  const [parentNameInput, setParentNameInput] = useState('');
+  const [parentContactsByStudent, setParentContactsByStudent] = useState<
+    Record<string, ParentContact>
+  >(() => {
+    try {
+      const saved = localStorage.getItem('tetrad_plus_parent_contacts');
+      if (saved) return JSON.parse(saved);
+    } catch {
+      // ignore storage errors
+    }
+    return {};
+  });
+  const [cardParentFullName, setCardParentFullName] = useState('');
+  const [cardParentEmail, setCardParentEmail] = useState('');
+  const [cardParentFormError, setCardParentFormError] = useState<string | null>(
+    null
+  );
+  const [cardParentSavedNotice, setCardParentSavedNotice] = useState(false);
+  const [sentReportsBySubmissionId, setSentReportsBySubmissionId] = useState<
+    Record<string, string>
+  >({});
+  const [isSendingParentReport, setIsSendingParentReport] = useState(false);
+  const [isDownloadingPdfReport, setIsDownloadingPdfReport] = useState(false);
+  const [parentReportError, setParentReportError] = useState<string | null>(
+    null
+  );
+  const [parentReportSuccess, setParentReportSuccess] = useState<string | null>(
+    null
+  );
+  const [deskPdfError, setDeskPdfError] = useState<string | null>(null);
+  const [serverHasSmtp, setServerHasSmtp] = useState(false);
+  // Gmail OAuth token stays in React memory only (never stored in localStorage/sessionStorage)
+  const [gmailAccessToken, setGmailAccessToken] = useState<string | null>(null);
+  const [gmailSenderEmail, setGmailSenderEmail] = useState<string | null>(null);
+  const [isConnectingGmail, setIsConnectingGmail] = useState(false);
+  const [isConfirmingGmailSend, setIsConfirmingGmailSend] = useState(false);
+  const [generatedPdfDownload, setGeneratedPdfDownload] = useState<{
+    url: string;
+    filename: string;
+    sizeKb: number;
+    submissionId: string;
+  } | null>(null);
+
+  useEffect(() => {
+    const currentUrl = generatedPdfDownload?.url;
+    return () => {
+      if (currentUrl) {
+        URL.revokeObjectURL(currentUrl);
+      }
+    };
+  }, [generatedPdfDownload]);
+
+  useEffect(() => {
+    setDeskPdfError(null);
+  }, [selectedSubmissionId]);
 
   // Custom error creation form state
   const [isAddingError, setIsAddingError] = useState(false);
@@ -317,11 +416,36 @@ export default function App() {
     });
   }, [submissions, statusFilter, subjectFilter, classFilter, searchQuery]);
 
-  const currentSubmission = useMemo(() => {
+  const currentSubmission = useMemo<NotebookSubmission | null>(() => {
+    if (submissions.length === 0) return null;
     return (
       submissions.find((s) => s.id === selectedSubmissionId) || submissions[0]
     );
   }, [submissions, selectedSubmissionId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'tetrad_plus_parent_contacts',
+        JSON.stringify(parentContactsByStudent)
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [parentContactsByStudent]);
+
+  useEffect(() => {
+    if (!currentSubmission) return;
+    const saved = parentContactsByStudent[currentSubmission.studentName];
+    setCardParentFullName(
+      saved?.parentFullName ?? currentSubmission.parentFullName ?? ''
+    );
+    setCardParentEmail(
+      saved?.parentEmail ?? currentSubmission.parentEmail ?? ''
+    );
+    setCardParentFormError(null);
+    setCardParentSavedNotice(false);
+  }, [currentSubmission, parentContactsByStudent]);
 
   const pendingCount = useMemo(
     () => submissions.filter((s) => s.status === 'pending').length,
@@ -334,6 +458,7 @@ export default function App() {
 
   // Calculate recommended ФГОС grade based on confirmed errors
   const recommendedFgosGrade = useMemo(() => {
+    if (!currentSubmission) return 5;
     const confirmedCount = currentSubmission.errors.filter(
       (e) => e.confirmedByTeacher
     ).length;
@@ -464,6 +589,8 @@ export default function App() {
       : classItem.defaultRuling;
     const isFirstGrade = classItem.gradeLevel === 1;
 
+    const savedContact = parentContactsByStudent[studentName];
+
     const newSub: NotebookSubmission = {
       id: `sub_${Date.now()}`,
       studentName,
@@ -471,35 +598,25 @@ export default function App() {
       subject,
       paperRuling: ruling,
       assignmentTitle: isMath
-        ? 'Домашняя работа · Примеры и текстовая задача'
-        : 'Домашняя работа · Списывание и словарные слова',
-      submittedDate: '9 октября',
+        ? 'Домашняя работа по математике'
+        : 'Домашняя работа',
+      submittedDate: new Date().toLocaleDateString('ru-RU'),
       status: 'pending',
       isFirstGradeNoGrades: isFirstGrade,
       verbalStamp: isFirstGrade
         ? 'Молодец! Старайся писать ровно.'
-        : 'Хорошая работа! Проверь выделенные места.',
+        : 'Хорошая работа!',
       contentGrade: 5,
       calligraphyGrade: 5,
-      handwrittenLines: isMath
-        ? [
-            '9 октября.',
-            'Домашняя работа.',
-            'Задача № 8.',
-            '1) 15 + 12 = 27 (шт.) — всего тетрадей в папке.',
-            'Ответ: 27 тетрадей.',
-            'Примеры: 34 + 25 = 59     68 - 14 = 54',
-          ]
-        : [
-            'Девятое октября.',
-            'Домашняя работа.',
-            'Упражнение 52.',
-            'Золотая осень украсила берёзки в роще.',
-            'Птицы готовятся к отлёту в тёплые края.',
-          ],
+      handwrittenLines: [
+        new Date().toLocaleDateString('ru-RU'),
+        'Домашняя работа.',
+      ],
       photoSampleUrl: isMath ? SAMPLE_PHOTOS.math : SAMPLE_PHOTOS.russian,
-      teacherSummary: `Новая тетрадь ученика ${studentName} (${classItem.name}) открыта из личного кабинета учителя.`,
+      teacherSummary: `Тетрадь ученика ${studentName} (${classItem.name}) создана учителем.`,
       parentMessage: `Здравствуйте! Домашняя работа ученика (${studentName}, ${classItem.name}) по предмету «${subject}» проверена.`,
+      parentFullName: savedContact?.parentFullName,
+      parentEmail: savedContact?.parentEmail,
       errors: [],
       customLineMarks: [],
       remediationTasks: [],
@@ -518,13 +635,42 @@ export default function App() {
   const handleConnectGoogleCloud = async () => {
     try {
       const cred = await signInTeacherWithGoogle();
+      if (cred.accessToken) {
+        setGmailAccessToken(cred.accessToken);
+        setGmailSenderEmail(cred.user?.email || null);
+      }
       if (cred.user && teacherProfile) {
         await upsertTeacherProfileInFirestore(cred.user.uid, teacherProfile);
       }
-      setApprovalBanner('Облачная синхронизация Firebase успешно подключена!');
+      setApprovalBanner('Аккаунт Google успешно подключён!');
       setTimeout(() => setApprovalBanner(null), 3500);
     } catch (err) {
       console.warn('Google sign-in cancelled or unavailable:', err);
+    }
+  };
+
+  const handleConnectGmail = async () => {
+    setIsConnectingGmail(true);
+    setParentReportError(null);
+    setParentReportSuccess(null);
+    try {
+      const cred = await signInTeacherWithGoogle();
+      if (!cred.accessToken) {
+        throw new Error(
+          'Разрешение на отправку писем через Gmail не было выдано. Повторите вход и отметьте доступ к отправке писем.'
+        );
+      }
+      setGmailAccessToken(cred.accessToken);
+      setGmailSenderEmail(cred.user?.email || null);
+      setIsConfirmingGmailSend(false);
+    } catch (err: any) {
+      const msg =
+        err?.code === 'auth/popup-closed-by-user'
+          ? 'Окно авторизации Google было закрыто до завершения входа.'
+          : err?.message || 'Не удалось подключить Google-аккаунт (Gmail).';
+      setParentReportError(msg);
+    } finally {
+      setIsConnectingGmail(false);
     }
   };
 
@@ -553,6 +699,10 @@ export default function App() {
   const handleEmailLogout = async () => {
     setAuthSession(null);
     setIsPhotoModalOpen(false);
+    clearGmailAccessToken();
+    setGmailAccessToken(null);
+    setGmailSenderEmail(null);
+    setIsConfirmingGmailSend(false);
     if (firebaseUser) {
       await signOutTeacher();
     }
@@ -574,6 +724,7 @@ export default function App() {
   };
 
   const handleToggleErrorConfirm = (errorId: string) => {
+    if (!currentSubmission) return;
     updateSubmission(currentSubmission.id, (sub) => {
       const updatedErrors = sub.errors.map((err) =>
         err.id === errorId
@@ -594,6 +745,7 @@ export default function App() {
   };
 
   const handleToggleLineMark = (lineIndex: number, symbol: MarginMarkSymbol) => {
+    if (!currentSubmission) return;
     updateSubmission(currentSubmission.id, (sub) => {
       const exists = sub.customLineMarks.some(
         (m) => m.lineIndex === lineIndex && m.symbol === symbol
@@ -618,6 +770,7 @@ export default function App() {
   };
 
   const handleChangePaperRuling = (ruling: PaperRulingType) => {
+    if (!currentSubmission) return;
     updateSubmission(currentSubmission.id, (sub) => ({
       ...sub,
       paperRuling: ruling,
@@ -628,6 +781,7 @@ export default function App() {
     field: 'contentGrade' | 'calligraphyGrade',
     val: number
   ) => {
+    if (!currentSubmission) return;
     updateSubmission(currentSubmission.id, (sub) => ({
       ...sub,
       [field]: val,
@@ -635,6 +789,7 @@ export default function App() {
   };
 
   const handleSetVerbalStamp = (stamp: string) => {
+    if (!currentSubmission) return;
     updateSubmission(currentSubmission.id, (sub) => ({
       ...sub,
       verbalStamp: stamp,
@@ -642,6 +797,7 @@ export default function App() {
   };
 
   const handleSetParentMessage = (msg: string) => {
+    if (!currentSubmission) return;
     updateSubmission(currentSubmission.id, (sub) => ({
       ...sub,
       parentMessage: msg,
@@ -650,7 +806,8 @@ export default function App() {
 
   const handleAddCustomError = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newErrorWrong.trim() || !newErrorCorrect.trim()) return;
+    if (!currentSubmission || !newErrorWrong.trim() || !newErrorCorrect.trim())
+      return;
 
     const newErr: NotebookError = {
       id: `err-custom-${Date.now()}`,
@@ -696,6 +853,7 @@ export default function App() {
   };
 
   const handleApproveAndNext = () => {
+    if (!currentSubmission) return;
     const approvedName = currentSubmission.studentName;
     const approvedGrade = `${currentSubmission.contentGrade}/${currentSubmission.calligraphyGrade}`;
 
@@ -719,6 +877,7 @@ export default function App() {
   };
 
   const handleCopyParentMessage = () => {
+    if (!currentSubmission) return;
     if (navigator.clipboard) {
       navigator.clipboard
         .writeText(currentSubmission.parentMessage)
@@ -726,6 +885,324 @@ export default function App() {
     }
     setCopiedParentFeedback(true);
     setTimeout(() => setCopiedParentFeedback(false), 2500);
+  };
+
+  const buildReportPayload = (sub: NotebookSubmission) => ({
+    studentName: sub.studentName,
+    classGroup: sub.classGroup,
+    subject: sub.subject,
+    assignmentTitle: sub.assignmentTitle,
+    submittedDate: sub.submittedDate,
+    teacherName: displayTeacherName,
+    isFirstGradeNoGrades: sub.isFirstGradeNoGrades,
+    contentGrade: sub.contentGrade,
+    calligraphyGrade: sub.calligraphyGrade,
+    praiseStamp: sub.verbalStamp,
+    errors: sub.errors.map((err) => ({
+      lineNumber: err.lineIndex + 1,
+      category: err.errorType,
+      wrongText: err.wrongFragment,
+      correctText: err.correctFragment,
+      explanation: err.explanation,
+      ruleRef: err.ruleName,
+      confirmedByTeacher: err.confirmedByTeacher,
+    })),
+    parentMessage: sub.parentMessage,
+    handwritingVerification: sub.handwritingVerification
+      ? {
+          match: sub.handwritingVerification.match,
+          confidence_score: sub.handwritingVerification.confidence_score,
+          reasoning: sub.handwritingVerification.reasoning,
+        }
+      : undefined,
+  });
+
+  const activeReportSubmission = reportTargetSubmission || currentSubmission;
+
+  const handleSaveParentContact = (
+    studentName: string,
+    contact: ParentContact
+  ) => {
+    const cleanContact: ParentContact = {
+      parentFullName: contact.parentFullName.trim(),
+      parentEmail: contact.parentEmail.trim(),
+    };
+    setParentContactsByStudent((prev) => ({
+      ...prev,
+      [studentName]: cleanContact,
+    }));
+    setSubmissions((prev) =>
+      prev.map((sub) =>
+        sub.studentName === studentName
+          ? {
+              ...sub,
+              parentFullName: cleanContact.parentFullName,
+              parentEmail: cleanContact.parentEmail,
+            }
+          : sub
+      )
+    );
+  };
+
+  const handleSaveStudentCardParentForm = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentSubmission) return;
+
+    const cleanFullName = cardParentFullName.trim();
+    const cleanEmail = cardParentEmail.trim();
+
+    if (!cleanFullName) {
+      setCardParentFormError('Укажите ФИО родителя.');
+      return;
+    }
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      setCardParentFormError('Укажите корректный E-mail родителя.');
+      return;
+    }
+
+    setCardParentFormError(null);
+    handleSaveParentContact(currentSubmission.studentName, {
+      parentFullName: cleanFullName,
+      parentEmail: cleanEmail,
+    });
+    setCardParentSavedNotice(true);
+    setTimeout(() => setCardParentSavedNotice(false), 3000);
+  };
+
+  const authorizedFetch = async (
+    input: RequestInfo | URL,
+    init: RequestInit = {}
+  ): Promise<Response | null> => {
+    if (!authSession) return null;
+
+    const makeRequest = (token: string) => {
+      const headers = new Headers(init.headers || {});
+      headers.set('Authorization', `Bearer ${token}`);
+      return fetch(input, { ...init, headers });
+    };
+
+    let activeToken = authSession.idToken;
+    let response = activeToken ? await makeRequest(activeToken) : null;
+
+    if ((!response || response.status === 401) && authSession.refreshToken) {
+      try {
+        const verifyRes = await fetch('/api/auth/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken: authSession.refreshToken }),
+        });
+        if (verifyRes.ok) {
+          const verifyData = await safeParseJsonResponse(verifyRes);
+          if (verifyData?.valid && verifyData?.idToken && verifyData?.user) {
+            const refreshedSession: AuthSession = {
+              user: verifyData.user,
+              idToken: verifyData.idToken,
+              refreshToken:
+                verifyData.refreshToken || authSession.refreshToken,
+            };
+            setAuthSession(refreshedSession);
+            activeToken = verifyData.idToken;
+            response = await makeRequest(activeToken);
+          }
+        }
+      } catch {
+        // Ignore refresh network error and handle 401 below
+      }
+    }
+
+    if (!response || response.status === 401) {
+      await handleEmailLogout();
+      return null;
+    }
+
+    return response;
+  };
+
+  const handleOpenParentReportModal = (targetSub?: NotebookSubmission) => {
+    const sub = targetSub || currentSubmission;
+    if (!sub) return;
+    const saved = parentContactsByStudent[sub.studentName];
+    setReportTargetSubmission(sub);
+    setParentEmailInput(saved?.parentEmail ?? sub.parentEmail ?? '');
+    setParentNameInput(saved?.parentFullName ?? sub.parentFullName ?? '');
+    setParentReportError(null);
+    setParentReportSuccess(null);
+    setDeskPdfError(null);
+    setIsConfirmingGmailSend(false);
+    setIsParentReportModalOpen(true);
+  };
+
+  const handleDownloadPdfReport = async (targetSub?: NotebookSubmission) => {
+    const sub = targetSub || activeReportSubmission;
+    if (!authSession || !sub) return;
+    setIsDownloadingPdfReport(true);
+    setParentReportError(null);
+    setDeskPdfError(null);
+    try {
+      const response = await authorizedFetch('/api/report-pdf', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          report: buildReportPayload(sub),
+        }),
+      });
+      if (!response) return;
+
+      const contentType = (
+        response.headers.get('content-type') || ''
+      ).toLowerCase();
+
+      if (!response.ok || !contentType.includes('pdf')) {
+        const errData = await safeParseJsonResponse(response).catch(() => null);
+        throw new Error(
+          errData?.error || 'Сервер не смог сформировать PDF-отчёт.'
+        );
+      }
+
+      const rawBlob = await response.blob();
+      if (!rawBlob || rawBlob.size === 0) {
+        throw new Error('Сформированный PDF-файл оказался пустым.');
+      }
+
+      const pdfBlob = new Blob([rawBlob], { type: 'application/pdf' });
+      const url = URL.createObjectURL(pdfBlob);
+      const safeName = sub.studentName
+        .toLowerCase()
+        .replace(/[^a-zа-яё0-9]+/gi, '_')
+        .replace(/^_+|_+$/g, '');
+      const filename = `otchet_${safeName || 'tetrad'}.pdf`;
+      const sizeKb = Math.max(1, Math.round(pdfBlob.size / 1024));
+
+      setGeneratedPdfDownload({
+        url,
+        filename,
+        sizeKb,
+        submissionId: sub.id,
+      });
+
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.rel = 'noopener noreferrer';
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+
+      setParentReportSuccess(
+        `PDF-отчёт сформирован (${sizeKb} КБ). Если скачивание не началось автоматически, используйте ссылку ниже.`
+      );
+      setApprovalBanner(`PDF-отчёт для ${sub.studentName} сформирован (${sizeKb} КБ).`);
+      setTimeout(() => setApprovalBanner(null), 4000);
+    } catch (err: any) {
+      const message = err?.message || 'Ошибка при скачивании PDF-отчёта.';
+      setParentReportError(message);
+      setDeskPdfError(message);
+    } finally {
+      setIsDownloadingPdfReport(false);
+    }
+  };
+
+  const executeSendParentReport = async () => {
+    if (!authSession || !activeReportSubmission) return;
+
+    const cleanEmail = parentEmailInput.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      setParentReportError('Введите корректный Email получателя.');
+      return;
+    }
+
+    setIsSendingParentReport(true);
+    setParentReportError(null);
+    setParentReportSuccess(null);
+
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (gmailAccessToken) {
+        headers['X-Gmail-Access-Token'] = gmailAccessToken;
+      }
+
+      const response = await authorizedFetch('/api/send-parent-report', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          recipientEmail: cleanEmail,
+          parentName: parentNameInput.trim(),
+          report: buildReportPayload(activeReportSubmission),
+        }),
+      });
+
+      if (!response) return;
+
+      const data = await safeParseJsonResponse(response);
+      if (!response.ok) {
+        if (data?.requiresGmailAuth) {
+          clearGmailAccessToken();
+          setGmailAccessToken(null);
+          setIsConfirmingGmailSend(false);
+        }
+        throw new Error(
+          data?.error || 'Не удалось отправить отчёт на указанный Email.'
+        );
+      }
+
+      setIsConfirmingGmailSend(false);
+      handleSaveParentContact(activeReportSubmission.studentName, {
+        parentFullName:
+          parentNameInput.trim() ||
+          parentContactsByStudent[activeReportSubmission.studentName]
+            ?.parentFullName ||
+          '',
+        parentEmail: cleanEmail,
+      });
+      setSentReportsBySubmissionId((prev) => ({
+        ...prev,
+        [activeReportSubmission.id]: cleanEmail,
+      }));
+      const successText =
+        data?.message || `PDF-отчёт успешно отправлен на ${cleanEmail}.`;
+      setParentReportSuccess(successText);
+      setApprovalBanner(successText);
+      setTimeout(() => setApprovalBanner(null), 4000);
+    } catch (err: any) {
+      setParentReportError(
+        err?.message || 'Не удалось отправить PDF-отчёт родителю.'
+      );
+    } finally {
+      setIsSendingParentReport(false);
+    }
+  };
+
+  const handleSendParentReport = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!authSession || !activeReportSubmission) return;
+
+    const cleanEmail = parentEmailInput.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      setParentReportError('Введите корректный Email получателя.');
+      return;
+    }
+
+    if (!gmailAccessToken && !serverHasSmtp) {
+      setParentReportError(
+        'Нажмите кнопку «Войти через Google» выше, чтобы отправить PDF-отчёт через Gmail.'
+      );
+      return;
+    }
+
+    // Explicit user confirmation before sending email via Gmail on behalf of user
+    if (gmailAccessToken && !isConfirmingGmailSend) {
+      setParentReportError(null);
+      setParentReportSuccess(null);
+      setIsConfirmingGmailSend(true);
+      return;
+    }
+
+    await executeSendParentReport();
   };
 
   const handleAddCheckedSubmission = (newSub: NotebookSubmission) => {
@@ -736,13 +1213,12 @@ export default function App() {
   };
 
   const handleUpdateAndReanalyzeLines = async (newLines: string[]) => {
-    if (!authSession?.idToken) return;
+    if (!authSession || !currentSubmission) return;
     try {
-      const response = await fetch('/api/check-notebook', {
+      const response = await authorizedFetch('/api/check-notebook', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${authSession.idToken}`,
         },
         body: JSON.stringify({
           subject: currentSubmission.subject,
@@ -751,11 +1227,7 @@ export default function App() {
           studentWrittenText: newLines.join('\n'),
         }),
       });
-      if (response.status === 401) {
-        await handleEmailLogout();
-        return;
-      }
-      if (!response.ok) return;
+      if (!response || !response.ok) return;
       const data = await safeParseJsonResponse(response);
       const res = data.result;
       if (!res) return;
@@ -798,14 +1270,13 @@ export default function App() {
   };
 
   const handleGenerateRemediationCard = async (sub: NotebookSubmission) => {
-    if (!authSession?.idToken) return;
+    if (!authSession) return;
     setGeneratingRemediationForId(sub.id);
     try {
-      const response = await fetch('/api/generate-remediation', {
+      const response = await authorizedFetch('/api/generate-remediation', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${authSession.idToken}`,
         },
         body: JSON.stringify({
           studentName: sub.studentName,
@@ -814,11 +1285,7 @@ export default function App() {
           errors: sub.errors.filter((e) => e.confirmedByTeacher),
         }),
       });
-      if (response.status === 401) {
-        await handleEmailLogout();
-        return;
-      }
-      if (response.ok) {
+      if (response && response.ok) {
         const data = await safeParseJsonResponse(response);
         setGeneratedCards((prev) => ({
           ...prev,
@@ -1109,6 +1576,8 @@ export default function App() {
             onUpdateClass={handleUpdateClass}
             onDeleteClass={handleDeleteClass}
             onCreateNotebookForStudent={handleCreateNotebookForStudent}
+            parentContacts={parentContactsByStudent}
+            onSaveParentContact={handleSaveParentContact}
             onConnectGoogleCloud={handleConnectGoogleCloud}
             onLogout={handleLogoutCabinet}
           />
@@ -1303,7 +1772,7 @@ export default function App() {
                     </div>
                   ) : (
                     filteredSubmissions.map((sub) => {
-                      const isSelected = sub.id === currentSubmission.id;
+                      const isSelected = sub.id === currentSubmission?.id;
                       const activeErrorCount = sub.errors.filter(
                         (e) => e.confirmedByTeacher
                       ).length;
@@ -1385,6 +1854,40 @@ export default function App() {
               </div>
             </aside>
 
+            {!currentSubmission ? (
+              <section className="lg:col-span-9 bg-white border border-slate-200 rounded-xl p-8 sm:p-12 text-center space-y-5">
+                <div className="w-12 h-12 rounded-xl bg-slate-100 border border-slate-200 flex items-center justify-center mx-auto">
+                  <BookOpen className="w-6 h-6 text-slate-700" />
+                </div>
+                <div className="space-y-2 max-w-lg mx-auto">
+                  <h1 className="text-xl font-semibold text-slate-900">
+                    Список учеников и тетрадей пока пуст
+                  </h1>
+                  <p className="text-xs text-slate-600 leading-relaxed">
+                    В программе нет заранее созданных учеников. Добавьте свой класс и заведите учеников вручную в личном кабинете, либо сразу загрузите фотографию тетради.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center justify-center gap-3 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('cabinet')}
+                    className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold border border-slate-300 rounded-lg text-slate-800 hover:bg-slate-50 transition-colors cursor-pointer"
+                  >
+                    <UserCircle2 className="w-4 h-4 text-sky-700" />
+                    <span>Добавить классы и учеников вручную</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsPhotoModalOpen(true)}
+                    className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors cursor-pointer"
+                  >
+                    <Camera className="w-4 h-4" />
+                    <span>Камера / Загрузить фото тетради</span>
+                  </button>
+                </div>
+              </section>
+            ) : (
+            <>
             {/* CENTER STAGE: Interactive Notebook Sheet (6 cols) */}
             <section className="lg:col-span-6 space-y-4">
               {/* Assignment Context Header */}
@@ -1448,6 +1951,68 @@ export default function App() {
                     </div>
                   </div>
                 )}
+
+                {/* Student Card: Parent Full Name & E-mail Form */}
+                <form
+                  onSubmit={handleSaveStudentCardParentForm}
+                  className="pt-3 border-t border-slate-200 space-y-2"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-800 flex items-center gap-1.5">
+                      <Mail className="w-3.5 h-3.5 text-slate-600" />
+                      <span>Контакты родителя (для отправки отчётов)</span>
+                    </span>
+                    {cardParentSavedNotice && (
+                      <span className="text-[11px] font-medium text-emerald-700 flex items-center gap-1">
+                        <Check className="w-3 h-3" />
+                        <span>Сохранено в карточке ученика</span>
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
+                    <div className="sm:col-span-5">
+                      <label htmlFor="student-card-parent-name" className="sr-only">
+                        ФИО родителя
+                      </label>
+                      <input
+                        id="student-card-parent-name"
+                        type="text"
+                        value={cardParentFullName}
+                        onChange={(e) => setCardParentFullName(e.target.value)}
+                        placeholder="ФИО родителя (например, Иванова Анна Сергеевна)"
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-sky-600"
+                      />
+                    </div>
+                    <div className="sm:col-span-5">
+                      <label htmlFor="student-card-parent-email" className="sr-only">
+                        E-mail родителя
+                      </label>
+                      <input
+                        id="student-card-parent-email"
+                        type="email"
+                        value={cardParentEmail}
+                        onChange={(e) => setCardParentEmail(e.target.value)}
+                        placeholder="E-mail родителя (parent@example.ru)"
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-sky-600"
+                      />
+                    </div>
+                    <div className="sm:col-span-2">
+                      <button
+                        type="submit"
+                        className="w-full py-1.5 px-3 text-xs font-semibold bg-slate-900 text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        Сохранить
+                      </button>
+                    </div>
+                  </div>
+
+                  {cardParentFormError && (
+                    <p className="text-[11px] text-red-600">
+                      {cardParentFormError}
+                    </p>
+                  )}
+                </form>
               </div>
 
               {/* Manual Teacher Error Addition Form (Expandable) */}
@@ -1721,27 +2286,79 @@ export default function App() {
                   className="w-full p-2.5 text-xs text-slate-700 border border-slate-200 rounded-lg bg-slate-50/60 focus:bg-white focus:outline-none focus:ring-2 focus:ring-sky-600"
                 />
 
-                <button
-                  type="button"
-                  onClick={handleCopyParentMessage}
-                  className="w-full flex items-center justify-center gap-1.5 py-2 px-3 text-xs font-medium border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
-                >
-                  {copiedParentFeedback ? (
-                    <>
-                      <Check className="w-3.5 h-3.5 text-emerald-600" />
-                      <span className="text-emerald-700 font-semibold">
-                        Скопировано для отправки родителям!
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="w-3.5 h-3.5" />
-                      <span>Скопировать комментарий в дневник</span>
-                    </>
+                <div className="space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => handleOpenParentReportModal(currentSubmission)}
+                    className="w-full flex items-center justify-center gap-1.5 py-2.5 px-3 text-xs font-semibold bg-slate-900 text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+                  >
+                    <Mail className="w-3.5 h-3.5" />
+                    <span>Отправить отчет родителю</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadPdfReport(currentSubmission)}
+                    disabled={isDownloadingPdfReport}
+                    className="w-full flex items-center justify-center gap-1.5 py-2 px-3 text-xs font-medium border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 disabled:opacity-50 transition-colors cursor-pointer"
+                  >
+                    {isDownloadingPdfReport ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Download className="w-3.5 h-3.5" />
+                    )}
+                    <span>Скачать PDF-отчёт</span>
+                  </button>
+                  {deskPdfError && (
+                    <div className="p-2 rounded-lg bg-red-50 border border-red-200 text-[11px] text-red-700">
+                      {deskPdfError}
+                    </div>
                   )}
-                </button>
+                  {generatedPdfDownload &&
+                    generatedPdfDownload.submissionId ===
+                      currentSubmission.id && (
+                      <div className="p-2 rounded-lg bg-emerald-50 border border-emerald-200 text-[11px] text-emerald-800 flex items-center justify-between gap-2">
+                        <span>
+                          PDF готов ({generatedPdfDownload.sizeKb} КБ)
+                        </span>
+                        <a
+                          href={generatedPdfDownload.url}
+                          download={generatedPdfDownload.filename}
+                          className="font-semibold underline text-emerald-900 hover:text-emerald-700 shrink-0"
+                        >
+                          Скачать файл
+                        </a>
+                      </div>
+                    )}
+                  {sentReportsBySubmissionId[currentSubmission.id] && (
+                    <div className="text-[11px] text-emerald-700 text-center">
+                      Отчёт отправлен на {sentReportsBySubmissionId[currentSubmission.id]}
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={handleCopyParentMessage}
+                    className="w-full flex items-center justify-center gap-1.5 py-2 px-3 text-xs font-medium border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                  >
+                    {copiedParentFeedback ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-600" />
+                        <span className="text-emerald-700 font-semibold">
+                          Скопировано для отправки родителям!
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Скопировать комментарий в дневник</span>
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
             </aside>
+            </>
+            )}
           </div>
         )}
 
@@ -1773,10 +2390,14 @@ export default function App() {
                 <div>
                   <span className="block text-xs text-slate-500">Средний балл</span>
                   <span className="font-mono-tabular text-xl font-semibold text-slate-900">
-                    {(
-                      submissions.reduce((acc, s) => acc + s.contentGrade, 0) /
-                      submissions.length
-                    ).toFixed(1)}
+                    {submissions.length > 0
+                      ? (
+                          submissions.reduce(
+                            (acc, s) => acc + s.contentGrade,
+                            0
+                          ) / submissions.length
+                        ).toFixed(1)
+                      : '—'}
                   </span>
                 </div>
               </div>
@@ -1855,7 +2476,17 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200 text-xs">
-                    {filteredSubmissions.map((sub) => {
+                    {filteredSubmissions.length === 0 ? (
+                      <tr>
+                        <td
+                          colSpan={7}
+                          className="py-10 px-4 text-center text-slate-500"
+                        >
+                          Работ учеников пока нет. Добавьте учеников в личном кабинете или загрузите фото тетради.
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredSubmissions.map((sub) => {
                       const errCount = sub.errors.filter(
                         (e) => e.confirmedByTeacher
                       ).length;
@@ -1893,20 +2524,34 @@ export default function App() {
                             )}
                           </td>
                           <td className="py-3 px-4 text-right">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setSelectedSubmissionId(sub.id);
-                                setActiveTab('desk');
-                              }}
-                              className="text-sky-700 hover:text-sky-900 font-semibold hover:underline cursor-pointer"
-                            >
-                              Открыть тетрадь →
-                            </button>
+                            <div className="flex items-center justify-end gap-3">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenParentReportModal(sub)}
+                                className="inline-flex items-center gap-1 text-slate-700 hover:text-slate-900 font-medium hover:underline cursor-pointer"
+                              >
+                                <Mail className="w-3.5 h-3.5" />
+                                <span>
+                                  {sentReportsBySubmissionId[sub.id]
+                                    ? 'Отправлено'
+                                    : 'Отчёт родителю'}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedSubmissionId(sub.id);
+                                  setActiveTab('desk');
+                                }}
+                                className="text-sky-700 hover:text-sky-900 font-semibold hover:underline cursor-pointer"
+                              >
+                                Открыть тетрадь →
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       );
-                    })}
+                    }))}
                   </tbody>
                 </table>
               </div>
@@ -1936,6 +2581,11 @@ export default function App() {
               </button>
             </div>
 
+            {submissions.length === 0 ? (
+              <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-xs text-slate-500">
+                Карточки работы над ошибками появятся после добавления учеников и проверки их тетрадей.
+              </div>
+            ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               {submissions.map((sub) => {
                 const customAiCard = generatedCards[sub.id];
@@ -2053,6 +2703,7 @@ export default function App() {
                 );
               })}
             </div>
+            )}
           </div>
         )}
 
@@ -2175,6 +2826,344 @@ export default function App() {
           authToken={authSession.idToken}
           onAuthExpired={handleEmailLogout}
         />
+      )}
+
+      {/* Parent PDF Report & Email Modal */}
+      {authSession && isParentReportModalOpen && activeReportSubmission && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-xs p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="parent-report-modal-title"
+        >
+          <div className="w-full max-w-lg bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 bg-slate-50">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-slate-900 text-white flex items-center justify-center">
+                  <Mail className="w-4 h-4" />
+                </div>
+                <div>
+                  <h2
+                    id="parent-report-modal-title"
+                    className="text-sm font-semibold text-slate-900"
+                  >
+                    Отправить отчёт родителю (PDF)
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    {activeReportSubmission.studentName} ·{' '}
+                    {activeReportSubmission.classGroup} ·{' '}
+                    {activeReportSubmission.subject}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsParentReportModalOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-200/70 transition-colors cursor-pointer"
+                aria-label="Закрыть окно отправки отчёта"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form
+              onSubmit={handleSendParentReport}
+              className="p-6 space-y-4 text-xs"
+            >
+              {/* Included PDF Report Contents Summary */}
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                <div className="font-semibold text-slate-900">
+                  Содержимое PDF-отчёта:
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-slate-600">
+                  <div>
+                    Отметка:{' '}
+                    <span className="font-semibold text-red-700">
+                      {activeReportSubmission.isFirstGradeNoGrades
+                        ? 'Усвоено / Зачёт'
+                        : `${activeReportSubmission.contentGrade} / ${activeReportSubmission.calligraphyGrade}`}
+                    </span>
+                  </div>
+                  <div>
+                    Ошибок в отчёте:{' '}
+                    <span className="font-semibold text-slate-900 font-mono-tabular">
+                      {
+                        activeReportSubmission.errors.filter(
+                          (e) => e.confirmedByTeacher
+                        ).length
+                      }
+                    </span>
+                  </div>
+                </div>
+                <div className="text-slate-600 truncate">
+                  Задание: {activeReportSubmission.assignmentTitle}
+                </div>
+              </div>
+
+              {/* Email Delivery Method: Gmail (Google Sign-In) or Server SMTP */}
+              <div className="p-3.5 rounded-xl border border-slate-200 bg-white space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-slate-900">
+                    Способ отправки письма
+                  </span>
+                  {gmailAccessToken ? (
+                    <span className="text-[11px] font-medium text-emerald-700">
+                      Gmail подключён
+                    </span>
+                  ) : serverHasSmtp ? (
+                    <span className="text-[11px] font-medium text-emerald-700">
+                      SMTP настроен
+                    </span>
+                  ) : (
+                    <span className="text-[11px] font-medium text-amber-700">
+                      Требуется вход в Gmail
+                    </span>
+                  )}
+                </div>
+
+                {gmailAccessToken ? (
+                  <div className="flex items-center justify-between gap-2 text-xs text-slate-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                    <div className="min-w-0 truncate">
+                      Отправитель:{' '}
+                      <span className="font-semibold text-emerald-900">
+                        {gmailSenderEmail || 'Аккаунт Google (Gmail)'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleConnectGmail}
+                      disabled={isConnectingGmail}
+                      className="text-[11px] font-semibold text-sky-700 hover:underline shrink-0 cursor-pointer"
+                    >
+                      Сменить
+                    </button>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <p className="text-[11px] text-slate-600 leading-relaxed">
+                      {serverHasSmtp
+                        ? 'Отправка доступна через почтовый сервер школы (SMTP) или напрямую через ваш Gmail:'
+                        : 'Подключите ваш Google-аккаунт, чтобы отправлять PDF-отчёт напрямую через Gmail — без настройки SMTP и паролей приложений.'}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleConnectGmail}
+                      disabled={isConnectingGmail}
+                      className="inline-flex items-center justify-center gap-2.5 h-10 px-4 bg-white hover:bg-slate-50 border border-[#747775] rounded-full text-xs font-medium text-[#1f1f1f] transition-colors disabled:opacity-50 cursor-pointer shadow-2xs"
+                    >
+                      <svg
+                        version="1.1"
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 48 48"
+                        className="w-4 h-4 shrink-0"
+                        aria-hidden="true"
+                      >
+                        <path
+                          fill="#EA4335"
+                          d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+                        />
+                        <path
+                          fill="#4285F4"
+                          d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+                        />
+                        <path
+                          fill="#FBBC05"
+                          d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+                        />
+                        <path
+                          fill="#34A853"
+                          d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+                        />
+                      </svg>
+                      <span>
+                        {isConnectingGmail
+                          ? 'Подключение Gmail...'
+                          : 'Sign in with Google (Gmail)'}
+                      </span>
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="parent-email-input"
+                  className="block font-medium text-slate-700"
+                >
+                  Email родителя (получателя) *
+                </label>
+                <input
+                  id="parent-email-input"
+                  type="email"
+                  required
+                  placeholder="parent@example.ru"
+                  value={parentEmailInput}
+                  onChange={(e) => {
+                    setParentEmailInput(e.target.value);
+                    setIsConfirmingGmailSend(false);
+                  }}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-600"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="parent-name-input"
+                  className="block font-medium text-slate-700"
+                >
+                  Имя и отчество родителя (необязательно)
+                </label>
+                <input
+                  id="parent-name-input"
+                  type="text"
+                  placeholder="например, Анна Сергеевна"
+                  value={parentNameInput}
+                  onChange={(e) => {
+                    setParentNameInput(e.target.value);
+                    setIsConfirmingGmailSend(false);
+                  }}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-600"
+                />
+              </div>
+
+              {parentReportError && (
+                <div className="flex items-start gap-2 p-3 rounded-lg bg-red-50 border border-red-200 text-red-800">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+                  <span>{parentReportError}</span>
+                </div>
+              )}
+
+              {parentReportSuccess && (
+                <div className="flex items-start gap-2 p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800">
+                  <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-emerald-600" />
+                  <span>{parentReportSuccess}</span>
+                </div>
+              )}
+
+              {generatedPdfDownload &&
+                generatedPdfDownload.submissionId ===
+                  activeReportSubmission.id && (
+                  <div className="flex items-center justify-between gap-2 p-3 rounded-lg bg-sky-50 border border-sky-200 text-sky-900">
+                    <span className="text-xs">
+                      PDF сформирован ({generatedPdfDownload.sizeKb} КБ)
+                    </span>
+                    <a
+                      href={generatedPdfDownload.url}
+                      download={generatedPdfDownload.filename}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-white border border-sky-300 rounded-md text-sky-800 hover:bg-sky-100 shrink-0"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Скачать файл</span>
+                    </a>
+                  </div>
+                )}
+
+              {isConfirmingGmailSend && gmailAccessToken && (
+                <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 space-y-2.5">
+                  <div className="font-semibold text-xs">
+                    Подтвердите отправку письма через ваш Gmail:
+                  </div>
+                  <div className="text-[11px] space-y-1 text-amber-900">
+                    <div>
+                      От кого:{' '}
+                      <span className="font-medium">
+                        {gmailSenderEmail || 'ваш аккаунт Google'}
+                      </span>
+                    </div>
+                    <div>
+                      Кому:{' '}
+                      <span className="font-semibold">
+                        {parentEmailInput.trim()}
+                      </span>
+                    </div>
+                    <div className="truncate">
+                      Тема: Отчёт о проверке тетради:{' '}
+                      {activeReportSubmission.studentName} (
+                      {activeReportSubmission.subject})
+                    </div>
+                    <div>Вложение: PDF-отчёт о проверке тетради</div>
+                  </div>
+                  <div className="flex items-center justify-end gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setIsConfirmingGmailSend(false)}
+                      disabled={isSendingParentReport}
+                      className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-100 cursor-pointer"
+                    >
+                      Отмена
+                    </button>
+                    <button
+                      type="button"
+                      onClick={executeSendParentReport}
+                      disabled={isSendingParentReport}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 cursor-pointer"
+                    >
+                      {isSendingParentReport ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>Отправка...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Check className="w-3.5 h-3.5" />
+                          <span>Подтвердить и отправить</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => handleDownloadPdfReport(activeReportSubmission)}
+                  disabled={isDownloadingPdfReport || isSendingParentReport}
+                  className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 disabled:opacity-50 transition-colors cursor-pointer"
+                >
+                  {isDownloadingPdfReport ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Download className="w-3.5 h-3.5" />
+                  )}
+                  <span>Скачать PDF-отчёт</span>
+                </button>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsConfirmingGmailSend(false);
+                      setIsParentReportModalOpen(false);
+                    }}
+                    className="px-3.5 py-2 text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer"
+                  >
+                    Закрыть
+                  </button>
+                  {!isConfirmingGmailSend && (
+                    <button
+                      type="submit"
+                      disabled={isSendingParentReport || isDownloadingPdfReport}
+                      className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition-colors cursor-pointer"
+                    >
+                      {isSendingParentReport ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>Отправка...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Mail className="w-3.5 h-3.5" />
+                          <span>Отправить PDF на Email</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );

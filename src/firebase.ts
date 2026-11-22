@@ -49,7 +49,9 @@ if (isClientFirebaseConfigured) {
     ...firebaseConfig,
     apiKey: resolvedClientApiKey,
   });
-  db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  const firestoreDbId = (firebaseConfig as Record<string, any>)
+    .firestoreDatabaseId;
+  db = firestoreDbId ? getFirestore(app, firestoreDbId) : getFirestore(app);
   auth = getAuth(app);
 }
 
@@ -341,16 +343,48 @@ export function subscribeToTeacherClasses(
   );
 }
 
+export const WORKSPACE_SCOPES = [
+  'https://www.googleapis.com/auth/gmail.send',
+];
+
+// Access token is kept strictly in memory (never in localStorage or sessionStorage)
+let cachedGmailAccessToken: string | null = null;
+
+export function getGmailAccessToken(): string | null {
+  return cachedGmailAccessToken;
+}
+
+export function clearGmailAccessToken(): void {
+  cachedGmailAccessToken = null;
+}
+
 // Auth helpers
 export async function signInTeacherWithGoogle() {
   if (!auth) {
-    throw new Error('Клиентский Firebase Auth не настроен (используйте вход по email/паролю).');
+    throw new Error(
+      'Клиентский Firebase Auth не настроен. Проверьте конфигурацию Firebase.'
+    );
   }
   const provider = new GoogleAuthProvider();
-  return signInWithPopup(auth, provider);
+  for (const scope of WORKSPACE_SCOPES) {
+    provider.addScope(scope);
+  }
+  provider.setCustomParameters({
+    prompt: 'consent select_account',
+  });
+
+  const result = await signInWithPopup(auth, provider);
+  const credential = GoogleAuthProvider.credentialFromResult(result);
+  cachedGmailAccessToken = credential?.accessToken || null;
+
+  return {
+    user: result.user,
+    accessToken: cachedGmailAccessToken,
+  };
 }
 
 export async function signOutTeacher() {
+  cachedGmailAccessToken = null;
   if (!auth) return;
   return signOut(auth);
 }
