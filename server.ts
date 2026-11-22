@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import { createWorker } from 'tesseract.js';
 
+dotenv.config({ path: '.env.local' });
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -593,11 +594,23 @@ async function startServer() {
   const FIREBASE_SECURETOKEN_URL = 'https://securetoken.googleapis.com/v1/token';
 
   function getFirebaseWebApiKey(): string | null {
-    const candidates = [
+    const candidates: Array<unknown> = [
       process.env.FIREBASE_WEB_API_KEY,
       process.env.FIREBASE_API_KEY,
       process.env.VITE_FIREBASE_API_KEY,
     ];
+
+    // Also allow dynamic read from firebase-applet-config.json if user kept apiKey there
+    try {
+      const cfgPath = path.join(process.cwd(), 'firebase-applet-config.json');
+      if (fs.existsSync(cfgPath)) {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        if (cfg?.apiKey) candidates.push(cfg.apiKey);
+      }
+    } catch {
+      // ignore config read errors
+    }
+
     for (const raw of candidates) {
       if (
         raw &&
@@ -617,6 +630,10 @@ async function startServer() {
       EMAIL_EXISTS: 'Пользователь с таким email уже зарегистрирован.',
       OPERATION_NOT_ALLOWED:
         'Вход по email и паролю не включён в Firebase Console (Authentication -> Sign-in method -> Email/Password).',
+      PASSWORD_LOGIN_DISABLED:
+        'Вход и регистрация по email и паролю отключены в настройках Firebase Console. Откройте Authentication -> Sign-in method -> Email/Password и включите провайдер.',
+      ADMIN_ONLY_OPERATION:
+        'Самостоятельная регистрация отключена в настройках Firebase Authentication (включите Email/Password в Firebase Console).',
       TOO_MANY_ATTEMPTS_TRY_LATER:
         'Слишком много неудачных попыток входа. Попробуйте позже.',
       EMAIL_NOT_FOUND: 'Пользователь с таким email не найден.',
