@@ -35,6 +35,14 @@ export interface CustomLineMark {
   note: string;
 }
 
+export interface HandwritingVerificationResult {
+  match: boolean;
+  confidence_score: number;
+  reasoning: string;
+  modelUsed?: string;
+  checkedAt?: string;
+}
+
 export interface NotebookSubmission {
   id: string;
   studentName: string;
@@ -55,6 +63,7 @@ export interface NotebookSubmission {
   errors: NotebookError[];
   customLineMarks: CustomLineMark[];
   remediationTasks: RemediationTask[];
+  handwritingVerification?: HandwritingVerificationResult;
 }
 
 export interface FgosNormItem {

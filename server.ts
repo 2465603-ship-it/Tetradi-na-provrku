@@ -1355,6 +1355,126 @@ ${
     }
   });
 
+  // Endpoint 3: Graphological Handwriting Verification (Reference vs Current Notebook)
+  app.post('/api/verify-handwriting', requireFirebaseAuth, async (req, res) => {
+    try {
+      const {
+        studentName = 'Ученик',
+        referenceImageBase64,
+        referenceMimeType = 'image/jpeg',
+        currentImageBase64,
+        currentMimeType = 'image/jpeg',
+        sampleId = '',
+      } = req.body || {};
+
+      const cleanStudentName =
+        typeof studentName === 'string' && studentName.trim()
+          ? studentName.trim().slice(0, 120)
+          : 'Ученик';
+
+      const referencePayload = resolveImagePayload(
+        referenceImageBase64,
+        referenceMimeType
+      );
+      const currentPayload = resolveImagePayload(
+        currentImageBase64,
+        currentMimeType,
+        sampleId
+      );
+
+      if (!referencePayload || !currentPayload) {
+        return res.status(400).json({
+          error:
+            'Для сверки почерка необходимы два изображения: Изображение №1 (эталон ученика) и Изображение №2 (текущая работа).',
+        });
+      }
+
+      const prompt = `Ты — эксперт по графологии и компьютерному зрению. Твоя задача — сравнить рукописный текст на двух изображениях и определить, принадлежат ли они одному человеку.
+
+Входные данные:
+1. Изображение №1 (Эталон): Фотография тетради, достоверно написанная учеником ${cleanStudentName}.
+2. Изображение №2 (Текущая работа): Фотография новой страницы тетради, которую нужно идентифицировать.
+
+Твои инструкции:
+1. Анализ паттернов: Сравни наклон букв, степень нажима, характерные особенности написания отдельных символов (например, букв 'а', 'т', 'д') и расстояние между словами.
+2. Верификация: Если стили письма совпадают с высокой степенью уверенности, выведи match: true, confidence_score (число от 0.0 до 1.0) и краткое пояснение в reasoning.
+3. Несоответствие: Если почерк явно отличается, выведи match: false, confidence_score (число от 0.0 до 1.0) и краткое пояснение в reasoning.
+4. Важно: Будь максимально критичен. Если почерк неразборчив или изображение низкого качества, укажи это в поле reasoning.
+
+Формат ответа: Только чистый JSON, без лишнего текста.`;
+
+      const parts: Array<{
+        text?: string;
+        inlineData?: { data: string; mimeType: string };
+      }> = [
+        { text: 'Изображение №1 (Эталон почерка):' },
+        {
+          inlineData: {
+            mimeType: referencePayload.mimeType,
+            data: referencePayload.data,
+          },
+        },
+        { text: 'Изображение №2 (Текущая работа для идентификации):' },
+        {
+          inlineData: {
+            mimeType: currentPayload.mimeType,
+            data: currentPayload.data,
+          },
+        },
+        { text: prompt },
+      ];
+
+      const schema = {
+        type: Type.OBJECT,
+        properties: {
+          match: {
+            type: Type.BOOLEAN,
+            description:
+              'true, если почерки на двух изображениях принадлежат одному человеку, иначе false.',
+          },
+          confidence_score: {
+            type: Type.NUMBER,
+            description: 'Оценка уверенности от 0.0 до 1.0.',
+          },
+          reasoning: {
+            type: Type.STRING,
+            description:
+              'Краткое графологическое пояснение (наклон, нажим, написание букв, интервалы или неразборчивость).',
+          },
+        },
+        required: ['match', 'confidence_score', 'reasoning'],
+      };
+
+      const { modelUsed, parsed } = await callGeminiMultimodalWithFallback(
+        parts,
+        'Ты — строгий эксперт по графологии и компьютерному зрению. Сравнивай рукописный почерк максимально критично. Отвечай строго чистым JSON на русском языке.',
+        schema
+      );
+
+      const rawScore = Number(parsed?.confidence_score);
+      const confidenceScore = Number.isFinite(rawScore)
+        ? Math.max(0, Math.min(1, Number(rawScore.toFixed(2))))
+        : 0.5;
+
+      return res.json({
+        match: Boolean(parsed?.match),
+        confidence_score: confidenceScore,
+        reasoning:
+          typeof parsed?.reasoning === 'string' && parsed.reasoning.trim()
+            ? parsed.reasoning.trim()
+            : 'Анализ завершён без дополнительного комментария.',
+        modelUsed,
+      });
+    } catch (error: any) {
+      console.error('Error in /api/verify-handwriting:', error);
+      return res.status(500).json({
+        error:
+          error?.message ||
+          'Не удалось выполнить графологическую сверку почерка. Проверьте чёткость изображений и наличие GEMINI_API_KEY.',
+      });
+    }
+  });
+
   // Ensure unknown /api/* routes always return JSON 404 (never fall through to HTML SPA)
   app.all('/api/*', (req, res) => {
     res.status(404).json({

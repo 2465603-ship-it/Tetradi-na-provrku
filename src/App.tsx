@@ -49,6 +49,8 @@ import {
   Sparkles,
   ArrowRight,
   UserCircle2,
+  ShieldCheck,
+  ShieldAlert,
 } from 'lucide-react';
 
 type ActiveTab = 'desk' | 'journal' | 'remediation' | 'norms' | 'cabinet';
@@ -1386,29 +1388,66 @@ export default function App() {
             {/* CENTER STAGE: Interactive Notebook Sheet (6 cols) */}
             <section className="lg:col-span-6 space-y-4">
               {/* Assignment Context Header */}
-              <div className="p-4 bg-white border border-slate-200 rounded-xl flex flex-wrap items-center justify-between gap-3">
-                <div className="space-y-1">
-                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                    <span>{currentSubmission.classGroup}</span>
-                    <span aria-hidden="true">·</span>
-                    <span>{currentSubmission.subject}</span>
-                    <span aria-hidden="true">·</span>
-                    <span>Сдано: {currentSubmission.submittedDate}</span>
+              <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                      <span>{currentSubmission.classGroup}</span>
+                      <span aria-hidden="true">·</span>
+                      <span>{currentSubmission.subject}</span>
+                      <span aria-hidden="true">·</span>
+                      <span>Сдано: {currentSubmission.submittedDate}</span>
+                    </div>
+                    <h1 className="text-lg font-semibold text-slate-900">
+                      {currentSubmission.studentName} —{' '}
+                      {currentSubmission.assignmentTitle}
+                    </h1>
                   </div>
-                  <h1 className="text-lg font-semibold text-slate-900">
-                    {currentSubmission.studentName} —{' '}
-                    {currentSubmission.assignmentTitle}
-                  </h1>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsAddingError(!isAddingError)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-red-600" />
+                    <span>Добавить ошибку вручную</span>
+                  </button>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => setIsAddingError(!isAddingError)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5 text-red-600" />
-                  <span>Добавить ошибку вручную</span>
-                </button>
+                {currentSubmission.handwritingVerification && (
+                  <div
+                    className={`flex items-start gap-2 px-3 py-2 rounded-lg border text-xs ${
+                      currentSubmission.handwritingVerification.match
+                        ? 'bg-emerald-50/70 border-emerald-200 text-emerald-900'
+                        : 'bg-amber-50/80 border-amber-200 text-amber-900'
+                    }`}
+                  >
+                    {currentSubmission.handwritingVerification.match ? (
+                      <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                    ) : (
+                      <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <span className="font-semibold">
+                        {currentSubmission.handwritingVerification.match
+                          ? 'Почерк соответствует эталону'
+                          : 'Почерк отличается от эталона'}
+                      </span>{' '}
+                      <span className="font-mono-tabular opacity-80">
+                        (уверенность{' '}
+                        {Math.round(
+                          currentSubmission.handwritingVerification
+                            .confidence_score * 100
+                        )}
+                        %)
+                      </span>
+                      <span className="mx-1.5 opacity-50">·</span>
+                      <span className="opacity-90">
+                        {currentSubmission.handwritingVerification.reasoning}
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Manual Teacher Error Addition Form (Expandable) */}

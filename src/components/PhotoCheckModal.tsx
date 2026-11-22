@@ -5,14 +5,20 @@ import {
   MarginMarkSymbol,
   ErrorCategory,
   SchoolClassItem,
+  HandwritingVerificationResult,
 } from '../types/notebook';
 import { SAMPLE_PHOTOS } from '../data/initialSubmissions';
+import { safeParseJsonResponse } from '../utils/api';
 import {
   Camera,
   CheckCircle2,
   FileText,
+  Fingerprint,
   Loader2,
+  ShieldAlert,
+  ShieldCheck,
   Sparkles,
+  Trash2,
   Upload,
   X,
   AlertCircle,
@@ -142,8 +148,21 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
   >('environment');
   const [cameraError, setCameraError] = useState<string | null>(null);
 
+  // Graphological Handwriting Verification states (Image #1 Reference vs Image #2 Current)
+  const [showHandwritingVerifier, setShowHandwritingVerifier] = useState(false);
+  const [referenceImageBase64, setReferenceImageBase64] = useState<
+    string | null
+  >(null);
+  const [referenceMimeType, setReferenceMimeType] =
+    useState<string>('image/jpeg');
+  const [isVerifyingHandwriting, setIsVerifyingHandwriting] = useState(false);
+  const [handwritingResult, setHandwritingResult] =
+    useState<HandwritingVerificationResult | null>(null);
+  const [handwritingError, setHandwritingError] = useState<string | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileCameraInputRef = useRef<HTMLInputElement | null>(null);
+  const referenceFileInputRef = useRef<HTMLInputElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
@@ -300,6 +319,31 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
     }
   }, [isOpen, activeClassGroup, activeStudentName, activeSubject, classes]);
 
+  // Load saved handwriting reference photo for the selected student if available
+  useEffect(() => {
+    if (!isOpen) return;
+    const cleanName = studentName.trim();
+    if (!cleanName) {
+      setReferenceImageBase64(null);
+      return;
+    }
+    try {
+      const savedRef = localStorage.getItem(
+        `tetrad_plus_hw_ref:${cleanName.toLowerCase()}`
+      );
+      if (savedRef) {
+        setReferenceImageBase64(savedRef);
+        setReferenceMimeType('image/jpeg');
+      } else {
+        setReferenceImageBase64(null);
+      }
+    } catch {
+      setReferenceImageBase64(null);
+    }
+    setHandwritingResult(null);
+    setHandwritingError(null);
+  }, [isOpen, studentName]);
+
   if (!isOpen) return null;
 
   const selectedClassObj = classes.find((c) => c.name === classGroup);
@@ -453,15 +497,7 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
         }),
       });
 
-      const rawText = await response.text();
-      let data: any = {};
-      try {
-        data = JSON.parse(rawText);
-      } catch {
-        throw new Error(
-          `Ошибка сервера (${response.status}): размер снимка слишком велик или требуется повторная публикация (Deploy) приложения.`
-        );
-      }
+      const data = await safeParseJsonResponse(response);
 
       if (response.status === 401 && onAuthExpired) {
         onAuthExpired();
@@ -491,6 +527,134 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
       );
     } finally {
       setIsAnalyzing(false);
+    }
+  };
+
+  const handleReferenceFileUpload = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setHandwritingError(null);
+    setHandwritingResult(null);
+    try {
+      const normalized = await compressAndNormalizeImage(file);
+      setReferenceImageBase64(normalized.dataUrl);
+      setReferenceMimeType(normalized.mimeType);
+      const cleanName = studentName.trim();
+      if (cleanName) {
+        try {
+          localStorage.setItem(
+            `tetrad_plus_hw_ref:${cleanName.toLowerCase()}`,
+            normalized.dataUrl
+          );
+        } catch {
+          // Ignore localStorage quota limits for large images
+        }
+      }
+    } catch (err: any) {
+      setHandwritingError(
+        err?.message || 'Не удалось загрузить эталонное фото почерка.'
+      );
+    }
+    e.target.value = '';
+  };
+
+  const handleClearReferencePhoto = () => {
+    setReferenceImageBase64(null);
+    setHandwritingResult(null);
+    setHandwritingError(null);
+    const cleanName = studentName.trim();
+    if (cleanName) {
+      try {
+        localStorage.removeItem(
+          `tetrad_plus_hw_ref:${cleanName.toLowerCase()}`
+        );
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const handleVerifyHandwriting = async () => {
+    setHandwritingError(null);
+
+    if (!referenceImageBase64) {
+      setHandwritingError(
+        'Загрузите Изображение №1 (эталон тетради ученика) для сравнения.'
+      );
+      return;
+    }
+
+    let activeCurrentBase64 = customImageBase64;
+    if (isCameraActive) {
+      const snapped = handleCaptureSnapshotFromCamera();
+      if (snapped) activeCurrentBase64 = snapped;
+    }
+
+    if (
+      (selectedSample === 'custom' || selectedSample === 'camera') &&
+      !activeCurrentBase64
+    ) {
+      setHandwritingError(
+        'Загрузите или сфотографируйте текущую страницу тетради (Изображение №2).'
+      );
+      return;
+    }
+
+    setIsVerifyingHandwriting(true);
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (authToken) {
+        headers.Authorization = `Bearer ${authToken}`;
+      }
+
+      const response = await fetch('/api/verify-handwriting', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          studentName: studentName.trim() || 'Ученик',
+          referenceImageBase64,
+          referenceMimeType,
+          currentImageBase64: activeCurrentBase64,
+          currentMimeType: customMimeType,
+          sampleId:
+            selectedSample === 'math'
+              ? 'math'
+              : selectedSample === 'russian'
+              ? 'russian'
+              : 'custom',
+        }),
+      });
+
+      const data = await safeParseJsonResponse(response);
+      if (response.status === 401 && onAuthExpired) {
+        onAuthExpired();
+      }
+      if (!response.ok) {
+        throw new Error(
+          data?.error || 'Не удалось выполнить графологическую сверку почерка.'
+        );
+      }
+
+      setHandwritingResult({
+        match: Boolean(data.match),
+        confidence_score: Number(data.confidence_score ?? 0),
+        reasoning: String(data.reasoning || ''),
+        modelUsed: data.modelUsed,
+        checkedAt: new Date().toLocaleTimeString('ru-RU', {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      });
+    } catch (err: any) {
+      setHandwritingError(
+        err?.message || 'Ошибка при сравнении почерка на сервере.'
+      );
+    } finally {
+      setIsVerifyingHandwriting(false);
     }
   };
 
@@ -558,6 +722,7 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
       remediationTasks: Array.isArray(analysisResult.remediationTasks)
         ? analysisResult.remediationTasks
         : [],
+      handwritingVerification: handwritingResult || undefined,
     };
 
     onAddCheckedSubmission(newSubmission);
@@ -986,6 +1151,128 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
               </div>
             </div>
 
+            {/* Optional Graphological Handwriting Verification (Reference vs Current Photo) */}
+            <div className="p-3.5 rounded-lg border border-slate-200 bg-slate-50/70 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setShowHandwritingVerifier(!showHandwritingVerifier)
+                  }
+                  className="flex items-center gap-2 text-xs font-semibold text-slate-800 hover:text-red-700 transition-colors cursor-pointer"
+                >
+                  <Fingerprint className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>
+                    Сверка почерка с эталоном ученика (графология)
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setShowHandwritingVerifier(!showHandwritingVerifier)
+                  }
+                  className="text-[11px] font-medium text-sky-700 hover:underline cursor-pointer"
+                >
+                  {showHandwritingVerifier
+                    ? 'Скрыть'
+                    : referenceImageBase64
+                    ? 'Эталон загружен'
+                    : 'Открыть'}
+                </button>
+              </div>
+
+              {(showHandwritingVerifier || referenceImageBase64 || handwritingResult) && (
+                <div className="space-y-2.5 pt-1 border-t border-slate-200">
+                  <p className="text-[11px] text-slate-600">
+                    Загрузите <strong>Изображение №1 (эталон)</strong> — страницу
+                    тетради, достоверно написанную учеником{' '}
+                    <strong>{studentName || 'учеником'}</strong>. Система сравнит
+                    наклон, нажим, написание букв («а», «т», «д») и интервалы с
+                    текущей работой.
+                  </p>
+
+                  <input
+                    ref={referenceFileInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={handleReferenceFileUpload}
+                    className="hidden"
+                    aria-label="Загрузить эталонное фото почерка ученика"
+                  />
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    {referenceImageBase64 ? (
+                      <div className="flex items-center gap-2 flex-1 min-w-0 p-1.5 bg-white border border-slate-200 rounded-lg">
+                        <img
+                          src={referenceImageBase64}
+                          alt="Эталон почерка ученика"
+                          className="w-10 h-10 rounded object-cover border border-slate-200 shrink-0"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[11px] font-semibold text-slate-800 truncate">
+                            Эталон: {studentName || 'Ученик'}
+                          </div>
+                          <div className="text-[10px] text-emerald-700">
+                            Готово к сверке почерка
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => referenceFileInputRef.current?.click()}
+                          className="text-[11px] text-sky-700 hover:underline px-1.5 cursor-pointer"
+                        >
+                          Заменить
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleClearReferencePhoto}
+                          aria-label="Удалить эталон почерка"
+                          className="p-1 text-slate-400 hover:text-red-600 cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => referenceFileInputRef.current?.click()}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-slate-300 bg-white hover:bg-slate-100 text-slate-800 rounded-lg transition-colors cursor-pointer"
+                      >
+                        <Upload className="w-3.5 h-3.5 text-sky-600" />
+                        <span>Загрузить эталон почерка (Фото №1)</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={handleVerifyHandwriting}
+                      disabled={isVerifyingHandwriting || !referenceImageBase64}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white rounded-lg transition-colors cursor-pointer"
+                    >
+                      {isVerifyingHandwriting ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>Сверяем...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Fingerprint className="w-3.5 h-3.5" />
+                          <span>Сверить почерк</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  {handwritingError && (
+                    <div className="p-2.5 rounded-lg border border-red-200 bg-red-50 text-red-800 text-xs flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                      <span>{handwritingError}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
             <button
               type="button"
               onClick={handleRunAnalysis}
@@ -1007,7 +1294,39 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
           </div>
 
           {/* Right Column: Live Analysis Output */}
-          <div className="lg:col-span-6 flex flex-col justify-between border border-slate-200 rounded-xl p-4 bg-slate-50/60">
+          <div className="lg:col-span-6 flex flex-col justify-between border border-slate-200 rounded-xl p-4 bg-slate-50/60 space-y-3">
+            {handwritingResult && (
+              <div
+                className={`p-3.5 rounded-xl border text-xs space-y-1.5 ${
+                  handwritingResult.match
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-950'
+                    : 'bg-red-50 border-red-200 text-red-950'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 font-semibold">
+                    {handwritingResult.match ? (
+                      <>
+                        <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span>Почерк совпадает с эталоном ученика</span>
+                      </>
+                    ) : (
+                      <>
+                        <ShieldAlert className="w-4 h-4 text-red-600 shrink-0" />
+                        <span>Почерк отличается от эталона</span>
+                      </>
+                    )}
+                  </div>
+                  <span className="font-mono-tabular font-bold">
+                    Уверенность: {Math.round(handwritingResult.confidence_score * 100)}%
+                  </span>
+                </div>
+                <p className="leading-relaxed opacity-90">
+                  {handwritingResult.reasoning}
+                </p>
+              </div>
+            )}
+
             {errorMsg && (
               <div className="p-4 rounded-lg border border-red-200 bg-red-50 text-red-800 text-xs flex items-start gap-2 mb-3">
                 <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
