@@ -86,3 +86,16 @@ export interface SchoolClassItem {
   studentCount: number;
   studentsList: string; // newline-separated student names
 }
+
+export interface AuthUser {
+  uid: string;
+  email: string;
+  displayName?: string;
+  emailVerified?: boolean;
+}
+
+export interface AuthSession {
+  user: AuthUser;
+  idToken: string;
+  refreshToken: string;
+}

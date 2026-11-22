@@ -1,6 +1,7 @@
-import { initializeApp } from 'firebase/app';
+import { initializeApp, FirebaseApp } from 'firebase/app';
 import {
   getAuth,
+  Auth,
   GoogleAuthProvider,
   signInWithPopup,
   signOut,
@@ -10,6 +11,7 @@ import {
 } from 'firebase/auth';
 import {
   getFirestore,
+  Firestore,
   doc,
   getDoc,
   getDocFromServer,
@@ -29,12 +31,31 @@ import {
   PaperRulingType,
 } from './types/notebook';
 
-const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
-export const auth = getAuth(app);
+const resolvedClientApiKey =
+  (import.meta as any).env?.VITE_FIREBASE_API_KEY ||
+  (firebaseConfig as Record<string, any>).apiKey ||
+  '';
+
+export const isClientFirebaseConfigured = Boolean(
+  resolvedClientApiKey && resolvedClientApiKey !== 'MY_FIREBASE_WEB_API_KEY'
+);
+
+let app: FirebaseApp | null = null;
+export let db: Firestore | null = null;
+export let auth: Auth | null = null;
+
+if (isClientFirebaseConfigured) {
+  app = initializeApp({
+    ...firebaseConfig,
+    apiKey: resolvedClientApiKey,
+  });
+  db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  auth = getAuth(app);
+}
 
 // Validate connection to Firestore on boot (Mandatory per firebase-integration-rpc skill)
 async function testConnection() {
+  if (!db) return;
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
@@ -82,13 +103,13 @@ export function handleFirestoreError(
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
+      userId: auth?.currentUser?.uid,
+      email: auth?.currentUser?.email,
+      emailVerified: auth?.currentUser?.emailVerified,
+      isAnonymous: auth?.currentUser?.isAnonymous,
+      tenantId: auth?.currentUser?.tenantId,
       providerInfo:
-        auth.currentUser?.providerData?.map((provider) => ({
+        auth?.currentUser?.providerData?.map((provider) => ({
           providerId: provider.providerId,
           email: provider.email,
         })) || [],
@@ -173,6 +194,7 @@ export function sanitizeClassPayload(
 export async function fetchTeacherProfileFromFirestore(
   uid: string
 ): Promise<TeacherProfileData | null> {
+  if (!db) return null;
   const safeUid = sanitizeId(uid);
   const path = `teachers/${safeUid}`;
   try {
@@ -197,6 +219,7 @@ export async function upsertTeacherProfileInFirestore(
   uid: string,
   profile: Omit<TeacherProfileData, 'ownerId'>
 ): Promise<void> {
+  if (!db) return;
   const safeUid = sanitizeId(uid);
   const path = `teachers/${safeUid}`;
   const clean = sanitizeTeacherPayload(safeUid, profile);
@@ -231,6 +254,7 @@ export async function createClassInFirestore(
   classId: string,
   classData: Omit<SchoolClassItem, 'id' | 'ownerId'>
 ): Promise<void> {
+  if (!db) return;
   const safeClassId = sanitizeId(classId);
   const path = `classes/${safeClassId}`;
   const clean = sanitizeClassPayload(uid, classData);
@@ -251,6 +275,7 @@ export async function updateClassInFirestore(
   classId: string,
   classData: Omit<SchoolClassItem, 'id' | 'ownerId'>
 ): Promise<void> {
+  if (!db) return;
   const safeClassId = sanitizeId(classId);
   const path = `classes/${safeClassId}`;
   const clean = sanitizeClassPayload(uid, classData);
@@ -271,6 +296,7 @@ export async function updateClassInFirestore(
 }
 
 export async function deleteClassFromFirestore(classId: string): Promise<void> {
+  if (!db) return;
   const safeClassId = sanitizeId(classId);
   const path = `classes/${safeClassId}`;
   try {
@@ -285,6 +311,7 @@ export function subscribeToTeacherClasses(
   onData: (classes: SchoolClassItem[]) => void,
   onError?: (err: unknown) => void
 ) {
+  if (!db) return () => {};
   const safeUid = sanitizeId(uid);
   const path = 'classes';
   const q = query(collection(db, 'classes'), where('ownerId', '==', safeUid));
@@ -316,11 +343,15 @@ export function subscribeToTeacherClasses(
 
 // Auth helpers
 export async function signInTeacherWithGoogle() {
+  if (!auth) {
+    throw new Error('Клиентский Firebase Auth не настроен (используйте вход по email/паролю).');
+  }
   const provider = new GoogleAuthProvider();
   return signInWithPopup(auth, provider);
 }
 
 export async function signOutTeacher() {
+  if (!auth) return;
   return signOut(auth);
 }
 

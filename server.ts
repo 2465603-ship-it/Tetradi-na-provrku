@@ -588,6 +588,170 @@ async function startServer() {
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+  // Firebase Auth REST API helpers (reads FIREBASE_WEB_API_KEY strictly from env)
+  const FIREBASE_IDENTITY_BASE = 'https://identitytoolkit.googleapis.com/v1';
+  const FIREBASE_SECURETOKEN_URL = 'https://securetoken.googleapis.com/v1/token';
+
+  function getFirebaseWebApiKey(): string | null {
+    const candidates = [
+      process.env.FIREBASE_WEB_API_KEY,
+      process.env.FIREBASE_API_KEY,
+      process.env.VITE_FIREBASE_API_KEY,
+    ];
+    for (const raw of candidates) {
+      if (
+        raw &&
+        typeof raw === 'string' &&
+        raw.trim().length > 10 &&
+        raw.trim() !== 'MY_FIREBASE_WEB_API_KEY'
+      ) {
+        return raw.trim();
+      }
+    }
+    return null;
+  }
+
+  function mapFirebaseAuthError(rawCode: string): string {
+    const code = (rawCode || '').trim();
+    const map: Record<string, string> = {
+      EMAIL_EXISTS: 'Пользователь с таким email уже зарегистрирован.',
+      OPERATION_NOT_ALLOWED:
+        'Вход по email и паролю не включён в Firebase Console (Authentication -> Sign-in method -> Email/Password).',
+      TOO_MANY_ATTEMPTS_TRY_LATER:
+        'Слишком много неудачных попыток входа. Попробуйте позже.',
+      EMAIL_NOT_FOUND: 'Пользователь с таким email не найден.',
+      INVALID_PASSWORD: 'Неверный пароль.',
+      INVALID_LOGIN_CREDENTIALS: 'Неверный email или пароль.',
+      USER_DISABLED: 'Учётная запись заблокирована администратором.',
+      INVALID_EMAIL: 'Указан некорректный формат email.',
+      INVALID_ID_TOKEN: 'Сессия устарела. Выполните вход повторно.',
+      TOKEN_EXPIRED: 'Срок действия сессии истёк. Выполните вход повторно.',
+      USER_NOT_FOUND: 'Учётная запись не найдена.',
+    };
+    if (map[code]) return map[code];
+    if (code.startsWith('WEAK_PASSWORD')) {
+      return 'Пароль слишком простой (минимум 6 символов).';
+    }
+    if (code.includes('API_KEY_INVALID') || code.includes('API key not valid')) {
+      return 'Недействительный FIREBASE_WEB_API_KEY в переменных окружения сервера.';
+    }
+    return code
+      ? `Ошибка авторизации Firebase: ${code}`
+      : 'Не удалось выполнить запрос к серверу авторизации.';
+  }
+
+  async function safeParseUpstreamJson(resp: globalThis.Response): Promise<any> {
+    const text = await resp.text();
+    const trimmed = text.trim();
+    if (!trimmed) return {};
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return {
+        error: {
+          message: `UPSTREAM_NON_JSON_${resp.status}`,
+        },
+      };
+    }
+  }
+
+  async function lookupFirebaseUserByToken(
+    idToken: string,
+    apiKey: string
+  ): Promise<{
+    uid: string;
+    email: string;
+    displayName?: string;
+    emailVerified?: boolean;
+  } | null> {
+    if (!idToken || !apiKey) return null;
+    try {
+      const resp = await fetch(
+        `${FIREBASE_IDENTITY_BASE}/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+      if (!resp.ok) return null;
+      const data: any = await safeParseUpstreamJson(resp);
+      const fbUser = Array.isArray(data?.users) ? data.users[0] : null;
+      if (!fbUser?.localId) return null;
+      return {
+        uid: fbUser.localId,
+        email: fbUser.email || '',
+        displayName: fbUser.displayName || undefined,
+        emailVerified: Boolean(fbUser.emailVerified),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async function refreshFirebaseToken(refreshToken: string, apiKey: string) {
+    if (!refreshToken || !apiKey) return null;
+    try {
+      const body = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+      });
+      const resp = await fetch(
+        `${FIREBASE_SECURETOKEN_URL}?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body.toString(),
+        }
+      );
+      if (!resp.ok) return null;
+      const data: any = await safeParseUpstreamJson(resp);
+      if (!data?.id_token) return null;
+      return {
+        idToken: String(data.id_token),
+        refreshToken: String(data.refresh_token || refreshToken),
+        expiresIn: String(data.expires_in || '3600'),
+        uid: String(data.user_id || ''),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async function requireFirebaseAuth(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) {
+    const apiKey = getFirebaseWebApiKey();
+    if (!apiKey) {
+      return res.status(503).json({
+        error:
+          'Сервер не настроен для авторизации: задайте переменную окружения FIREBASE_WEB_API_KEY в файле .env или Secrets.',
+      });
+    }
+
+    const authHeader = req.headers.authorization || '';
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    const idToken = match?.[1]?.trim();
+    if (!idToken) {
+      return res.status(401).json({
+        error:
+          'Доступ запрещён: выполните вход или регистрацию, чтобы загружать и проверять тетради.',
+      });
+    }
+
+    const verifiedUser = await lookupFirebaseUserByToken(idToken, apiKey);
+    if (!verifiedUser) {
+      return res.status(401).json({
+        error: 'Сессия недействительна или истекла. Пожалуйста, войдите снова.',
+      });
+    }
+
+    (req as any).authUser = verifiedUser;
+    return next();
+  }
+
   // Health check endpoint for deployment probes
   app.get('/api/health', (_req, res) => {
     const keys = getCandidateApiKeys();
@@ -595,10 +759,201 @@ async function startServer() {
     res.status(200).json({
       status: 'ok',
       hasApiKey: keys.length > 0,
+      hasFirebaseAuthKey: Boolean(getFirebaseWebApiKey()),
       activeModel: modelConfig.primaryModel,
       fallbackModels: modelConfig.modelsToTry,
       temperature: modelConfig.temperature,
       thinkingLevel: modelConfig.thinkingLevel,
+    });
+  });
+
+  // Email/Password Registration via Firebase Auth REST API
+  app.post('/api/auth/register', async (req, res) => {
+    const apiKey = getFirebaseWebApiKey();
+    if (!apiKey) {
+      return res.status(503).json({
+        error:
+          'Не задан FIREBASE_WEB_API_KEY в .env (или Secrets AI Studio). Добавьте Web API Key вашего проекта Firebase.',
+      });
+    }
+
+    const { email, password, fullName } = req.body || {};
+    const cleanEmail = typeof email === 'string' ? email.trim() : '';
+    const cleanPassword = typeof password === 'string' ? password : '';
+    const cleanName = typeof fullName === 'string' ? fullName.trim() : '';
+
+    if (!cleanEmail || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cleanEmail)) {
+      return res.status(400).json({
+        error: 'Введите корректный адрес электронной почты.',
+      });
+    }
+    if (cleanPassword.length < 6) {
+      return res.status(400).json({
+        error: 'Пароль должен содержать минимум 6 символов.',
+      });
+    }
+
+    try {
+      const fbResp = await fetch(
+        `${FIREBASE_IDENTITY_BASE}/accounts:signUp?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: cleanEmail,
+            password: cleanPassword,
+            returnSecureToken: true,
+          }),
+        }
+      );
+
+      const fbData: any = await safeParseUpstreamJson(fbResp);
+      if (!fbResp.ok) {
+        const errCode = fbData?.error?.message || '';
+        return res.status(400).json({ error: mapFirebaseAuthError(errCode) });
+      }
+
+      if (cleanName) {
+        await fetch(
+          `${FIREBASE_IDENTITY_BASE}/accounts:update?key=${encodeURIComponent(apiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              idToken: fbData.idToken,
+              displayName: cleanName,
+              returnSecureToken: false,
+            }),
+          }
+        ).catch(() => {});
+      }
+
+      return res.json({
+        user: {
+          uid: fbData.localId,
+          email: fbData.email || cleanEmail,
+          displayName: cleanName || undefined,
+          emailVerified: false,
+        },
+        idToken: fbData.idToken,
+        refreshToken: fbData.refreshToken,
+        expiresIn: fbData.expiresIn,
+      });
+    } catch (err: any) {
+      return res.status(502).json({
+        error:
+          err?.message ||
+          'Не удалось связаться с сервером Firebase Authentication.',
+      });
+    }
+  });
+
+  // Email/Password Sign-In via Firebase Auth REST API
+  app.post('/api/auth/login', async (req, res) => {
+    const apiKey = getFirebaseWebApiKey();
+    if (!apiKey) {
+      return res.status(503).json({
+        error:
+          'Не задан FIREBASE_WEB_API_KEY в .env (или Secrets AI Studio). Добавьте Web API Key вашего проекта Firebase.',
+      });
+    }
+
+    const { email, password } = req.body || {};
+    const cleanEmail = typeof email === 'string' ? email.trim() : '';
+    const cleanPassword = typeof password === 'string' ? password : '';
+
+    if (!cleanEmail || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cleanEmail)) {
+      return res.status(400).json({
+        error: 'Введите корректный адрес электронной почты.',
+      });
+    }
+    if (!cleanPassword) {
+      return res.status(400).json({
+        error: 'Введите пароль.',
+      });
+    }
+
+    try {
+      const fbResp = await fetch(
+        `${FIREBASE_IDENTITY_BASE}/accounts:signInWithPassword?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: cleanEmail,
+            password: cleanPassword,
+            returnSecureToken: true,
+          }),
+        }
+      );
+
+      const fbData: any = await safeParseUpstreamJson(fbResp);
+      if (!fbResp.ok) {
+        const errCode = fbData?.error?.message || '';
+        return res.status(401).json({ error: mapFirebaseAuthError(errCode) });
+      }
+
+      return res.json({
+        user: {
+          uid: fbData.localId,
+          email: fbData.email || cleanEmail,
+          displayName: fbData.displayName || undefined,
+          emailVerified: Boolean(fbData.emailVerified),
+        },
+        idToken: fbData.idToken,
+        refreshToken: fbData.refreshToken,
+        expiresIn: fbData.expiresIn,
+      });
+    } catch (err: any) {
+      return res.status(502).json({
+        error:
+          err?.message ||
+          'Не удалось связаться с сервером Firebase Authentication.',
+      });
+    }
+  });
+
+  // Verify or refresh active session token via Firebase REST API
+  app.post('/api/auth/verify', async (req, res) => {
+    const apiKey = getFirebaseWebApiKey();
+    if (!apiKey) {
+      return res.status(503).json({
+        valid: false,
+        error: 'FIREBASE_WEB_API_KEY не настроен на сервере.',
+      });
+    }
+
+    const { idToken, refreshToken } = req.body || {};
+    if (typeof idToken === 'string' && idToken.trim()) {
+      const user = await lookupFirebaseUserByToken(idToken.trim(), apiKey);
+      if (user) {
+        return res.json({
+          valid: true,
+          user,
+          idToken: idToken.trim(),
+          refreshToken: typeof refreshToken === 'string' ? refreshToken : '',
+        });
+      }
+    }
+
+    if (typeof refreshToken === 'string' && refreshToken.trim()) {
+      const refreshed = await refreshFirebaseToken(refreshToken.trim(), apiKey);
+      if (refreshed) {
+        const user = await lookupFirebaseUserByToken(refreshed.idToken, apiKey);
+        if (user) {
+          return res.json({
+            valid: true,
+            user,
+            idToken: refreshed.idToken,
+            refreshToken: refreshed.refreshToken,
+          });
+        }
+      }
+    }
+
+    return res.status(401).json({
+      valid: false,
+      error: 'Сессия недействительна или истекла.',
     });
   });
 
@@ -653,8 +1008,8 @@ async function startServer() {
     });
   });
 
-  // Endpoint 1: Multimodal AI Notebook Photo & Handwriting Recognition
-  app.post('/api/check-notebook', async (req, res) => {
+  // Endpoint 1: Multimodal AI Notebook Photo & Handwriting Recognition (Protected by Firebase Auth)
+  app.post('/api/check-notebook', requireFirebaseAuth, async (req, res) => {
     try {
       const {
         imageBase64,
@@ -895,8 +1250,8 @@ ${
     }
   });
 
-  // Endpoint 2: Custom Remediation Card Generator via Gemini
-  app.post('/api/generate-remediation', async (req, res) => {
+  // Endpoint 2: Custom Remediation Card Generator via Gemini (Protected by Firebase Auth)
+  app.post('/api/generate-remediation', requireFirebaseAuth, async (req, res) => {
     try {
       const { studentName, gradeLevel, subject, errors = [] } = req.body || {};
 
@@ -982,6 +1337,29 @@ ${
       });
     }
   });
+
+  // Ensure unknown /api/* routes always return JSON 404 (never fall through to HTML SPA)
+  app.all('/api/*', (req, res) => {
+    res.status(404).json({
+      error: `API маршрут ${req.method} ${req.path} не найден. Если вы обновили приложение, выполните Deploy.`,
+    });
+  });
+
+  // Ensure Express body/middleware errors on /api/* always return JSON (never HTML)
+  app.use(
+    '/api',
+    (
+      err: any,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction
+    ) => {
+      const status = err?.status || err?.statusCode || 500;
+      res.status(status).json({
+        error: err?.message || 'Внутренняя ошибка сервера API.',
+      });
+    }
+  );
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');

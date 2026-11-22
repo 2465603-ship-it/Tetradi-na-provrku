@@ -8,6 +8,7 @@ import {
   NotebookError,
   TeacherProfileData,
   SchoolClassItem,
+  AuthSession,
 } from './types/notebook';
 import {
   INITIAL_SUBMISSIONS,
@@ -19,6 +20,8 @@ import {
 import { InteractiveNotebookSheet } from './components/InteractiveNotebookSheet';
 import { PhotoCheckModal } from './components/PhotoCheckModal';
 import { TeacherCabinetView } from './components/TeacherCabinetView';
+import { AuthSidebar } from './components/AuthSidebar';
+import { safeParseJsonResponse } from './utils/api';
 import {
   auth,
   fetchTeacherProfileFromFirestore,
@@ -39,6 +42,7 @@ import {
   Copy,
   FileCheck2,
   Loader2,
+  Lock,
   Plus,
   Printer,
   Search,
@@ -146,8 +150,87 @@ export default function App() {
     }
   }, [classes]);
 
-  // Listen to Firebase Auth state & sync Firestore profile + classes when authenticated
+  // Email/Password Firebase REST API Session State
+  const [authSession, setAuthSession] = useState<AuthSession | null>(() => {
+    try {
+      const saved = localStorage.getItem('tetrad_plus_auth_session');
+      if (saved) return JSON.parse(saved);
+    } catch {
+      // ignore storage errors
+    }
+    return null;
+  });
+  const [isCheckingSession, setIsCheckingSession] = useState<boolean>(() => {
+    try {
+      return Boolean(localStorage.getItem('tetrad_plus_auth_session'));
+    } catch {
+      return false;
+    }
+  });
+
+  // Persist email/password auth session
   useEffect(() => {
+    try {
+      if (authSession) {
+        localStorage.setItem(
+          'tetrad_plus_auth_session',
+          JSON.stringify(authSession)
+        );
+      } else {
+        localStorage.removeItem('tetrad_plus_auth_session');
+      }
+    } catch {
+      // ignore
+    }
+  }, [authSession]);
+
+  // Verify stored session with backend Firebase REST API on startup
+  useEffect(() => {
+    if (!authSession?.idToken && !authSession?.refreshToken) {
+      setIsCheckingSession(false);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/auth/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            idToken: authSession.idToken,
+            refreshToken: authSession.refreshToken,
+          }),
+        });
+        if (!res.ok) {
+          if (!cancelled) setAuthSession(null);
+          return;
+        }
+        const data = await safeParseJsonResponse(res);
+        if (!cancelled && data.valid && data.user) {
+          setAuthSession({
+            user: data.user,
+            idToken: data.idToken,
+            refreshToken: data.refreshToken || authSession.refreshToken,
+          });
+        } else if (!cancelled) {
+          setAuthSession(null);
+        }
+      } catch {
+        // Keep cached session offline only if network fails transiently
+      } finally {
+        if (!cancelled) setIsCheckingSession(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Listen to optional client Firebase Auth state & sync Firestore profile + classes when configured
+  useEffect(() => {
+    if (!auth) return;
     let unsubscribeClasses: (() => void) | null = null;
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
@@ -443,11 +526,39 @@ export default function App() {
     }
   };
 
-  const handleLogoutCabinet = async () => {
-    setTeacherProfile(null);
+  const handleAuthSuccess = (session: AuthSession) => {
+    setAuthSession(session);
+    if (!teacherProfile) {
+      setTeacherProfile({
+        ownerId: session.user.uid,
+        fullName:
+          session.user.displayName ||
+          session.user.email.split('@')[0] ||
+          'Учитель начальных классов',
+        phone: '+7 (900) 000-00-00',
+        schoolName: 'Общеобразовательная школа',
+        qualification: 'Первая квалификационная категория',
+        isPhoneVerified: true,
+        isCloudSynced: true,
+      });
+    }
+    setApprovalBanner(
+      `Добро пожаловать, ${session.user.displayName || session.user.email}! Загрузка и проверка тетрадей открыты.`
+    );
+    setTimeout(() => setApprovalBanner(null), 4000);
+  };
+
+  const handleEmailLogout = async () => {
+    setAuthSession(null);
+    setIsPhotoModalOpen(false);
     if (firebaseUser) {
       await signOutTeacher();
     }
+  };
+
+  const handleLogoutCabinet = async () => {
+    setTeacherProfile(null);
+    await handleEmailLogout();
   };
 
   // Handlers for updating current submission
@@ -623,10 +734,14 @@ export default function App() {
   };
 
   const handleUpdateAndReanalyzeLines = async (newLines: string[]) => {
+    if (!authSession?.idToken) return;
     try {
       const response = await fetch('/api/check-notebook', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authSession.idToken}`,
+        },
         body: JSON.stringify({
           subject: currentSubmission.subject,
           gradeLevel: currentSubmission.classGroup,
@@ -634,8 +749,12 @@ export default function App() {
           studentWrittenText: newLines.join('\n'),
         }),
       });
+      if (response.status === 401) {
+        await handleEmailLogout();
+        return;
+      }
       if (!response.ok) return;
-      const data = await response.json();
+      const data = await safeParseJsonResponse(response);
       const res = data.result;
       if (!res) return;
 
@@ -677,11 +796,15 @@ export default function App() {
   };
 
   const handleGenerateRemediationCard = async (sub: NotebookSubmission) => {
+    if (!authSession?.idToken) return;
     setGeneratingRemediationForId(sub.id);
     try {
       const response = await fetch('/api/generate-remediation', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authSession.idToken}`,
+        },
         body: JSON.stringify({
           studentName: sub.studentName,
           gradeLevel: sub.classGroup,
@@ -689,8 +812,12 @@ export default function App() {
           errors: sub.errors.filter((e) => e.confirmedByTeacher),
         }),
       });
+      if (response.status === 401) {
+        await handleEmailLogout();
+        return;
+      }
       if (response.ok) {
-        const data = await response.json();
+        const data = await safeParseJsonResponse(response);
         setGeneratedCards((prev) => ({
           ...prev,
           [sub.id]: data.result,
@@ -790,16 +917,33 @@ export default function App() {
         <div className="flex items-center gap-2.5">
           <button
             type="button"
-            onClick={() => setActiveTab('cabinet')}
+            onClick={() => setActiveTab(authSession ? 'cabinet' : 'desk')}
             className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <UserCircle2 className="w-3.5 h-3.5 text-slate-600" />
-            <span>{teacherProfile ? 'Мои классы' : 'Вход по телефону'}</span>
+            <span>
+              {authSession
+                ? authSession.user.email
+                : 'Вход / Регистрация'}
+            </span>
           </button>
           <button
             type="button"
-            onClick={() => setIsPhotoModalOpen(true)}
-            className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            disabled={!authSession}
+            onClick={() => {
+              if (!authSession) return;
+              setIsPhotoModalOpen(true);
+            }}
+            title={
+              authSession
+                ? 'Загрузить фото тетради'
+                : 'Доступно после авторизации в боковой панели'
+            }
+            className={`flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              authSession
+                ? 'text-white bg-red-600 hover:bg-red-700 cursor-pointer'
+                : 'text-slate-400 bg-slate-200 cursor-not-allowed'
+            }`}
           >
             <Camera className="w-3.5 h-3.5" />
             <span>Камера / Загрузить фото</span>
@@ -888,13 +1032,75 @@ export default function App() {
 
       {/* Main Content Container */}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-8 py-6">
+        {/* AUTH GATE: Notebook upload, cabinet & checking require Firebase Auth */}
+        {!authSession && activeTab !== 'norms' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            <aside className="lg:col-span-4">
+              <AuthSidebar
+                authSession={authSession}
+                isCheckingSession={isCheckingSession}
+                onAuthSuccess={handleAuthSuccess}
+                onLogout={handleEmailLogout}
+              />
+            </aside>
+            <section className="lg:col-span-8 bg-white border border-slate-200 rounded-xl p-8 space-y-5">
+              <div className="w-12 h-12 rounded-xl bg-red-50 border border-red-200 flex items-center justify-center">
+                <Lock className="w-6 h-6 text-red-600" />
+              </div>
+              <div className="space-y-2">
+                <h1 className="text-2xl font-semibold text-slate-900">
+                  Доступ к проверке и загрузке тетрадей закрыт
+                </h1>
+                <p className="text-sm text-slate-600 max-w-2xl">
+                  Для работы с фотографиями школьных тетрадей, журналом оценок,
+                  личным кабинетом классов и карточками работы над ошибками
+                  необходимо выполнить <strong>Вход</strong> или{' '}
+                  <strong>Регистрацию</strong> по email и паролю в боковой
+                  панели слева.
+                </p>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 text-xs text-slate-700">
+                <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                  <div className="font-semibold text-slate-900">
+                    1. Firebase Auth REST API
+                  </div>
+                  <p className="text-slate-600">
+                    Вход и регистрация выполняются через серверные эндпоинты с
+                    ключом из переменных окружения (.env).
+                  </p>
+                </div>
+                <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                  <div className="font-semibold text-slate-900">
+                    2. Защищённая сессия
+                  </div>
+                  <p className="text-slate-600">
+                    Сессия проверяется на сервере по Bearer-токену при загрузке и
+                    распознавании тетрадей.
+                  </p>
+                </div>
+                <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                  <div className="font-semibold text-slate-900">
+                    3. Личный кабинет
+                  </div>
+                  <p className="text-slate-600">
+                    После входа откроется камера, загрузка фото тетрадей и
+                    управление вашими классами.
+                  </p>
+                </div>
+              </div>
+            </section>
+          </div>
+        )}
+
         {/* VIEW 5: TEACHER PERSONAL CABINET & PHONE REGISTRATION */}
-        {activeTab === 'cabinet' && (
+        {authSession && activeTab === 'cabinet' && (
           <TeacherCabinetView
             teacherProfile={teacherProfile}
             classes={classes}
-            isFirebaseAuthenticated={Boolean(firebaseUser)}
-            firebaseEmail={firebaseUser?.email || null}
+            isFirebaseAuthenticated={Boolean(firebaseUser || authSession)}
+            firebaseEmail={
+              authSession?.user.email || firebaseUser?.email || null
+            }
             onCompletePhoneRegistration={handleCompletePhoneRegistration}
             onUpdateProfile={handleUpdateTeacherProfile}
             onCreateClass={(cls) => handleCreateClass(cls)}
@@ -907,10 +1113,17 @@ export default function App() {
         )}
 
         {/* VIEW 1: TEACHER DESK (Проверка тетрадей) */}
-        {activeTab === 'desk' && (
+        {authSession && activeTab === 'desk' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            {/* LEFT PANEL: Student Stack & Filters (3 cols) */}
+            {/* LEFT PANEL: Auth Sidebar + Student Stack & Filters (3 cols) */}
             <aside className="lg:col-span-3 space-y-4">
+              <AuthSidebar
+                authSession={authSession}
+                isCheckingSession={isCheckingSession}
+                onAuthSuccess={handleAuthSuccess}
+                onLogout={handleEmailLogout}
+              />
+
               {/* Teacher Profile Strip with direct link to Personal Cabinet */}
               <div className="p-4 bg-white border border-slate-200 rounded-xl space-y-3">
                 <div className="flex items-center gap-3">
@@ -1494,7 +1707,7 @@ export default function App() {
         )}
 
         {/* VIEW 2: CLASS GRADEBOOK & ANALYTICS (Журнал класса) */}
-        {activeTab === 'journal' && (
+        {authSession && activeTab === 'journal' && (
           <div className="space-y-6">
             <div className="flex flex-wrap items-end justify-between gap-4 bg-white p-6 border border-slate-200 rounded-xl">
               <div className="space-y-1">
@@ -1663,7 +1876,7 @@ export default function App() {
         )}
 
         {/* VIEW 3: REMEDIATION CARDS (Работа над ошибками) */}
-        {activeTab === 'remediation' && (
+        {authSession && activeTab === 'remediation' && (
           <div className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-4 bg-white p-6 border border-slate-200 rounded-xl no-print">
               <div className="space-y-1">
@@ -1908,18 +2121,22 @@ export default function App() {
         </div>
       </footer>
 
-      {/* AI Photo Check Modal */}
-      <PhotoCheckModal
-        isOpen={isPhotoModalOpen}
-        onClose={() => setIsPhotoModalOpen(false)}
-        onAddCheckedSubmission={handleAddCheckedSubmission}
-        classes={classes}
-        activeClassGroup={
-          classFilter !== 'all' ? classFilter : currentSubmission?.classGroup
-        }
-        activeStudentName={currentSubmission?.studentName}
-        activeSubject={currentSubmission?.subject}
-      />
+      {/* AI Photo Check Modal (Only available when authenticated) */}
+      {authSession && (
+        <PhotoCheckModal
+          isOpen={isPhotoModalOpen}
+          onClose={() => setIsPhotoModalOpen(false)}
+          onAddCheckedSubmission={handleAddCheckedSubmission}
+          classes={classes}
+          activeClassGroup={
+            classFilter !== 'all' ? classFilter : currentSubmission?.classGroup
+          }
+          activeStudentName={currentSubmission?.studentName}
+          activeSubject={currentSubmission?.subject}
+          authToken={authSession.idToken}
+          onAuthExpired={handleEmailLogout}
+        />
+      )}
     </div>
   );
 }

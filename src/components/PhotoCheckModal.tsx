@@ -30,6 +30,8 @@ interface PhotoCheckModalProps {
   activeClassGroup?: string;
   activeStudentName?: string;
   activeSubject?: SubjectType;
+  authToken?: string;
+  onAuthExpired?: () => void;
 }
 
 // Normalize & compress any photo (including 12MP mobile camera shots or HEIC/PNG) into a crisp JPEG <= 1600px
@@ -99,6 +101,8 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
   activeClassGroup,
   activeStudentName,
   activeSubject,
+  authToken,
+  onAuthExpired,
 }) => {
   const defaultClassName =
     activeClassGroup && activeClassGroup !== 'all'
@@ -422,9 +426,16 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
     setErrorMsg(null);
 
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (authToken) {
+        headers.Authorization = `Bearer ${authToken}`;
+      }
+
       const response = await fetch('/api/check-notebook', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           imageBase64: activeBase64,
           mimeType: customMimeType,
@@ -450,6 +461,10 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
         throw new Error(
           `Ошибка сервера (${response.status}): размер снимка слишком велик или требуется повторная публикация (Deploy) приложения.`
         );
+      }
+
+      if (response.status === 401 && onAuthExpired) {
+        onAuthExpired();
       }
 
       if (!response.ok) {

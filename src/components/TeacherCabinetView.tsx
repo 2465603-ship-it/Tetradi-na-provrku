@@ -5,6 +5,7 @@ import {
   PaperRulingType,
   SubjectType,
 } from '../types/notebook';
+import { safeParseJsonResponse } from '../utils/api';
 import {
   Check,
   CheckCircle2,
@@ -155,7 +156,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ phone: phoneInput }),
       });
-      const data = await res.json();
+      const data = await safeParseJsonResponse(res);
       if (!res.ok) {
         throw new Error(data.error || 'Не удалось отправить СМС-код');
       }
@@ -181,7 +182,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ phone: phoneInput, code: otpCode }),
       });
-      const data = await res.json();
+      const data = await safeParseJsonResponse(res);
       if (!res.ok) {
         throw new Error(data.error || 'Неверный код подтверждения');
       }
