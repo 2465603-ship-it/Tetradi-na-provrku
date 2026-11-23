@@ -12,6 +12,11 @@ import {
 import { SAMPLE_PHOTOS } from '../data/initialSubmissions';
 import { safeParseJsonResponse } from '../utils/api';
 import {
+  compressAndNormalizeImage,
+  blobToDataUrl,
+} from '../utils/imageCompression';
+import { ServiceReferenceImage } from './ServiceReferenceImage';
+import {
   Camera,
   CheckCircle2,
   FileText,
@@ -42,66 +47,18 @@ interface PhotoCheckModalProps {
   activeStudentName?: string;
   activeSubject?: SubjectType;
   authToken?: string;
+  onUploadStudentReferenceFile?: (
+    classItem: SchoolClassItem,
+    studentName: string,
+    imageBase64: string,
+    previousUrl?: string
+  ) => Promise<string>;
+  onDeleteStudentReferenceFile?: (
+    classItem: SchoolClassItem,
+    studentName: string,
+    currentUrl?: string
+  ) => Promise<void>;
   onAuthExpired?: () => void;
-}
-
-// Normalize & compress any photo (including 12MP mobile camera shots or HEIC/PNG) into a crisp JPEG <= 1600px
-function compressAndNormalizeImage(file: File | Blob): Promise<{
-  dataUrl: string;
-  mimeType: string;
-}> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error('Не удалось прочитать выбранный файл изображения'));
-    reader.onload = () => {
-      const rawDataUrl = reader.result as string;
-      const img = new Image();
-      img.onload = () => {
-        try {
-          const maxDim = 1600;
-          let width = img.naturalWidth || img.width || 1200;
-          let height = img.naturalHeight || img.height || 900;
-
-          if (width > maxDim || height > maxDim) {
-            if (width >= height) {
-              height = Math.round((height * maxDim) / width);
-              width = maxDim;
-            } else {
-              width = Math.round((width * maxDim) / height);
-              height = maxDim;
-            }
-          }
-
-          const canvas = document.createElement('canvas');
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) {
-            resolve({ dataUrl: rawDataUrl, mimeType: file.type || 'image/jpeg' });
-            return;
-          }
-          // Fill white background in case of transparent PNG
-          ctx.fillStyle = '#FFFFFF';
-          ctx.fillRect(0, 0, width, height);
-          ctx.drawImage(img, 0, 0, width, height);
-
-          const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.88);
-          resolve({
-            dataUrl: jpegDataUrl,
-            mimeType: 'image/jpeg',
-          });
-        } catch {
-          resolve({ dataUrl: rawDataUrl, mimeType: file.type || 'image/jpeg' });
-        }
-      };
-      img.onerror = () => {
-        // If browser cannot render the format on canvas, fallback to raw dataUrl
-        resolve({ dataUrl: rawDataUrl, mimeType: file.type || 'image/jpeg' });
-      };
-      img.src = rawDataUrl;
-    };
-    reader.readAsDataURL(file);
-  });
 }
 
 export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
@@ -114,6 +71,8 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
   activeStudentName,
   activeSubject,
   authToken,
+  onUploadStudentReferenceFile,
+  onDeleteStudentReferenceFile,
   onAuthExpired,
 }) => {
   const defaultClassName =
@@ -159,6 +118,8 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
   >(null);
   const [referenceMimeType, setReferenceMimeType] =
     useState<string>('image/jpeg');
+  const [isUploadingReferencePhoto, setIsUploadingReferencePhoto] =
+    useState(false);
   const [isVerifyingHandwriting, setIsVerifyingHandwriting] = useState(false);
   const [handwritingResult, setHandwritingResult] =
     useState<HandwritingVerificationResult | null>(null);
@@ -335,7 +296,7 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
     }
   }, [isOpen, activeClassGroup, activeStudentName, activeSubject, classes]);
 
-  // Load saved handwriting reference photo for the selected student if available
+  // Load saved handwriting reference photo (from local cache or directly from service storage)
   useEffect(() => {
     if (!isOpen) return;
     const cleanName = studentName.trim();
@@ -343,22 +304,57 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
       setReferenceImageBase64(null);
       return;
     }
+
+    let localSaved: string | null = null;
     try {
-      const savedRef = localStorage.getItem(
+      localSaved = localStorage.getItem(
         `tetrad_plus_hw_ref:${cleanName.toLowerCase()}`
       );
-      if (savedRef) {
-        setReferenceImageBase64(savedRef);
-        setReferenceMimeType('image/jpeg');
-      } else {
-        setReferenceImageBase64(null);
-      }
     } catch {
-      setReferenceImageBase64(null);
+      localSaved = null;
     }
+
     setHandwritingResult(null);
     setHandwritingError(null);
-  }, [isOpen, studentName]);
+
+    if (localSaved) {
+      setReferenceImageBase64(localSaved);
+      setReferenceMimeType('image/jpeg');
+      return;
+    }
+
+    const activeCls = classes.find((c) => c.name === classGroup);
+    const matchingRec = studentsRecords.find(
+      (sr) =>
+        sr.studentName.trim().toLowerCase() === cleanName.toLowerCase() &&
+        (!activeCls || !sr.classId || sr.classId === activeCls.id)
+    );
+    const savedUrl = matchingRec?.handwriting_reference_url?.trim() || '';
+
+    if (savedUrl.startsWith('/api/handwriting-references/') && authToken) {
+      let cancelled = false;
+      fetch(savedUrl, {
+        headers: { Authorization: `Bearer ${authToken}` },
+      })
+        .then(async (res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const blob = await res.blob();
+          const dataUrl = await blobToDataUrl(blob);
+          if (!cancelled && dataUrl) {
+            setReferenceImageBase64(dataUrl);
+            setReferenceMimeType(blob.type || 'image/jpeg');
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setReferenceImageBase64(null);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setReferenceImageBase64(null);
+  }, [isOpen, studentName, classGroup, classes, studentsRecords, authToken]);
 
   if (!isOpen) return null;
 
@@ -553,8 +549,9 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
     if (!file) return;
     setHandwritingError(null);
     setHandwritingResult(null);
+    setIsUploadingReferencePhoto(true);
     try {
-      const normalized = await compressAndNormalizeImage(file);
+      const normalized = await compressAndNormalizeImage(file, 1400, 0.86);
       setReferenceImageBase64(normalized.dataUrl);
       setReferenceMimeType(normalized.mimeType);
       const cleanName = studentName.trim();
@@ -567,16 +564,32 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
         } catch {
           // Ignore localStorage quota limits for large images
         }
+
+        if (selectedClassObj && onUploadStudentReferenceFile) {
+          const existingRec = studentsRecords.find(
+            (sr) =>
+              sr.studentName.trim().toLowerCase() === cleanName.toLowerCase() &&
+              (!sr.classId || sr.classId === selectedClassObj.id)
+          );
+          await onUploadStudentReferenceFile(
+            selectedClassObj,
+            cleanName,
+            normalized.dataUrl,
+            existingRec?.handwriting_reference_url
+          );
+        }
       }
     } catch (err: any) {
       setHandwritingError(
-        err?.message || 'Не удалось загрузить эталонное фото почерка.'
+        err?.message || 'Не удалось загрузить эталонное фото почерка в сервис.'
       );
+    } finally {
+      setIsUploadingReferencePhoto(false);
     }
     e.target.value = '';
   };
 
-  const handleClearReferencePhoto = () => {
+  const handleClearReferencePhoto = async () => {
     setReferenceImageBase64(null);
     setHandwritingResult(null);
     setHandwritingError(null);
@@ -588,6 +601,22 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
         );
       } catch {
         // ignore
+      }
+      if (selectedClassObj && onDeleteStudentReferenceFile) {
+        const existingRec = studentsRecords.find(
+          (sr) =>
+            sr.studentName.trim().toLowerCase() === cleanName.toLowerCase() &&
+            (!sr.classId || sr.classId === selectedClassObj.id)
+        );
+        try {
+          await onDeleteStudentReferenceFile(
+            selectedClassObj,
+            cleanName,
+            existingRec?.handwriting_reference_url
+          );
+        } catch {
+          // ignore cleanup failure
+        }
       }
     }
   };
@@ -674,7 +703,7 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
     }
   };
 
-  // Build candidate students with handwriting_reference_url (from Firestore students) or local cached reference photos
+  // Build candidate students with service-hosted or cached handwriting reference photos
   const candidateStudentsForIdentify = (() => {
     const seen = new Set<string>();
     const list: Array<{
@@ -698,9 +727,18 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
       const key = rec.studentName.trim().toLowerCase();
       if (!key || seen.has(key)) continue;
       seen.add(key);
+      let localBackup: string | undefined;
+      try {
+        localBackup = localStorage.getItem(`tetrad_plus_hw_ref:${key}`) || undefined;
+      } catch {
+        localBackup = undefined;
+      }
       list.push({
         studentName: rec.studentName.trim(),
         handwriting_reference_url: rec.handwriting_reference_url.trim(),
+        ...(localBackup
+          ? { referenceImageBase64: localBackup, referenceMimeType: 'image/jpeg' }
+          : {}),
       });
     }
 
@@ -748,7 +786,7 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
 
     if (candidateStudentsForIdentify.length === 0) {
       setIdentificationError(
-        'Ни у одного ученика ещё не задан эталон почерка (handwriting_reference_url) в Личном кабинете. Выберите ученика из списка или введите ФИО вручную.'
+        'Ни у одного ученика ещё не загружен эталон почерка в сервис. Загрузите фото эталона в Личном кабинете или в блоке «Сверка почерка» ниже.'
       );
       if (classStudents.length > 0) {
         studentSelectRef.current?.focus();
@@ -1111,16 +1149,28 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex items-center gap-2 min-w-0">
                         {(() => {
+                          const targetLower = (
+                            identificationResult.studentName || ''
+                          ).toLowerCase();
                           const matchedRef = studentsRecords.find(
-                            (r) =>
-                              r.studentName.trim().toLowerCase() ===
-                              (identificationResult.studentName || '').toLowerCase()
+                            (r) => r.studentName.trim().toLowerCase() === targetLower
                           );
-                          return matchedRef?.handwriting_reference_url ? (
-                            <img
-                              src={matchedRef.handwriting_reference_url}
-                              alt={`Эталон почерка ${matchedRef.studentName}`}
-                              referrerPolicy="no-referrer"
+                          let localThumb: string | null = null;
+                          try {
+                            if (targetLower) {
+                              localThumb = localStorage.getItem(
+                                `tetrad_plus_hw_ref:${targetLower}`
+                              );
+                            }
+                          } catch {
+                            localThumb = null;
+                          }
+                          return matchedRef?.handwriting_reference_url || localThumb ? (
+                            <ServiceReferenceImage
+                              src={matchedRef?.handwriting_reference_url || localThumb}
+                              fallbackSrc={localThumb}
+                              authToken={authToken}
+                              alt={`Эталон почерка ${matchedRef?.studentName || identificationResult.studentName || ''}`}
                               className="w-9 h-9 rounded object-cover border border-white shadow-2xs shrink-0"
                             />
                           ) : (
@@ -1571,21 +1621,25 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
                             Эталон: {studentName || 'Ученик'}
                           </div>
                           <div className="text-[10px] text-emerald-700">
-                            Готово к сверке почерка
+                            {isUploadingReferencePhoto
+                              ? 'Сохраняем эталон в сервис...'
+                              : 'Сохранено в сервисе · готово к сверке'}
                           </div>
                         </div>
                         <button
                           type="button"
+                          disabled={isUploadingReferencePhoto}
                           onClick={() => referenceFileInputRef.current?.click()}
-                          className="text-[11px] text-sky-700 hover:underline px-1.5 cursor-pointer"
+                          className="text-[11px] text-sky-700 hover:underline px-1.5 disabled:opacity-50 cursor-pointer"
                         >
                           Заменить
                         </button>
                         <button
                           type="button"
+                          disabled={isUploadingReferencePhoto}
                           onClick={handleClearReferencePhoto}
                           aria-label="Удалить эталон почерка"
-                          className="p-1 text-slate-400 hover:text-red-600 cursor-pointer"
+                          className="p-1 text-slate-400 hover:text-red-600 disabled:opacity-50 cursor-pointer"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -1593,11 +1647,20 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
                     ) : (
                       <button
                         type="button"
+                        disabled={isUploadingReferencePhoto}
                         onClick={() => referenceFileInputRef.current?.click()}
-                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-slate-300 bg-white hover:bg-slate-100 text-slate-800 rounded-lg transition-colors cursor-pointer"
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-slate-300 bg-white hover:bg-slate-100 text-slate-800 rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
                       >
-                        <Upload className="w-3.5 h-3.5 text-sky-600" />
-                        <span>Загрузить эталон почерка (Фото №1)</span>
+                        {isUploadingReferencePhoto ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-600" />
+                        ) : (
+                          <Upload className="w-3.5 h-3.5 text-sky-600" />
+                        )}
+                        <span>
+                          {isUploadingReferencePhoto
+                            ? 'Сохраняем эталон...'
+                            : 'Загрузить эталон в сервис (Фото №1)'}
+                        </span>
                       </button>
                     )}
 

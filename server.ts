@@ -635,6 +635,35 @@ async function startServer() {
     return null;
   }
 
+  function getFirebaseProjectId(): string {
+    const envId =
+      process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID;
+    if (envId && envId.trim() && envId.trim() !== 'MY_FIREBASE_PROJECT_ID') {
+      return envId.trim();
+    }
+    try {
+      const cfgPath = path.join(process.cwd(), 'firebase-applet-config.json');
+      if (fs.existsSync(cfgPath)) {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        if (typeof cfg?.projectId === 'string' && cfg.projectId.trim()) {
+          return cfg.projectId.trim();
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return '';
+  }
+
+  function isEmailPasswordDisabledCode(rawCode: string): boolean {
+    const code = (rawCode || '').trim();
+    return (
+      code === 'PASSWORD_LOGIN_DISABLED' ||
+      code === 'OPERATION_NOT_ALLOWED' ||
+      code === 'ADMIN_ONLY_OPERATION'
+    );
+  }
+
   function mapFirebaseAuthError(rawCode: string): string {
     const code = (rawCode || '').trim();
     const map: Record<string, string> = {
@@ -840,7 +869,13 @@ async function startServer() {
       const fbData: any = await safeParseUpstreamJson(fbResp);
       if (!fbResp.ok) {
         const errCode = fbData?.error?.message || '';
-        return res.status(400).json({ error: mapFirebaseAuthError(errCode) });
+        return res.status(400).json({
+          error: mapFirebaseAuthError(errCode),
+          code: isEmailPasswordDisabledCode(errCode)
+            ? 'EMAIL_PASSWORD_DISABLED'
+            : undefined,
+          projectId: getFirebaseProjectId() || undefined,
+        });
       }
 
       if (cleanName) {
@@ -920,7 +955,13 @@ async function startServer() {
       const fbData: any = await safeParseUpstreamJson(fbResp);
       if (!fbResp.ok) {
         const errCode = fbData?.error?.message || '';
-        return res.status(401).json({ error: mapFirebaseAuthError(errCode) });
+        return res.status(401).json({
+          error: mapFirebaseAuthError(errCode),
+          code: isEmailPasswordDisabledCode(errCode)
+            ? 'EMAIL_PASSWORD_DISABLED'
+            : undefined,
+          projectId: getFirebaseProjectId() || undefined,
+        });
       }
 
       return res.json({
@@ -1625,6 +1666,282 @@ ${
     }
   }
 
+  const HANDWRITING_UPLOAD_DIR = path.resolve(
+    process.cwd(),
+    'data',
+    'handwriting-references'
+  );
+  fs.mkdirSync(HANDWRITING_UPLOAD_DIR, { recursive: true });
+
+  const SAFE_FILE_ID_REGEX = /^[a-zA-Z0-9_-]+\.(?:jpg|png|webp)$/;
+  const SERVICE_REF_URL_REGEX =
+    /^\/api\/handwriting-references\/([a-zA-Z0-9_-]+\.(?:jpg|png|webp))$/;
+  const MAX_REFERENCE_IMAGE_BYTES = 5 * 1024 * 1024;
+
+  interface StoredReferenceMeta {
+    ownerUid: string;
+    classId: string;
+    studentName: string;
+    mimeType: string;
+    sizeBytes: number;
+    createdAt: string;
+  }
+
+  function detectImageTypeFromBytes(
+    buf: Buffer
+  ): { ext: 'jpg' | 'png' | 'webp'; mimeType: string } | null {
+    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+      return { ext: 'jpg', mimeType: 'image/jpeg' };
+    }
+    if (
+      buf.length >= 8 &&
+      buf[0] === 0x89 &&
+      buf[1] === 0x50 &&
+      buf[2] === 0x4e &&
+      buf[3] === 0x47 &&
+      buf[4] === 0x0d &&
+      buf[5] === 0x0a &&
+      buf[6] === 0x1a &&
+      buf[7] === 0x0a
+    ) {
+      return { ext: 'png', mimeType: 'image/png' };
+    }
+    if (
+      buf.length >= 12 &&
+      buf.toString('ascii', 0, 4) === 'RIFF' &&
+      buf.toString('ascii', 8, 12) === 'WEBP'
+    ) {
+      return { ext: 'webp', mimeType: 'image/webp' };
+    }
+    return null;
+  }
+
+  function resolveStoredReferencePaths(fileId: string): {
+    fileId: string;
+    filePath: string;
+    metaPath: string;
+  } | null {
+    if (!SAFE_FILE_ID_REGEX.test(fileId)) {
+      return null;
+    }
+    const filePath = path.resolve(HANDWRITING_UPLOAD_DIR, fileId);
+    const metaPath = path.resolve(HANDWRITING_UPLOAD_DIR, `${fileId}.meta.json`);
+    const dirPrefix = HANDWRITING_UPLOAD_DIR + path.sep;
+    if (!filePath.startsWith(dirPrefix) || !metaPath.startsWith(dirPrefix)) {
+      return null;
+    }
+    return { fileId, filePath, metaPath };
+  }
+
+  function readStoredReferenceMeta(metaPath: string): StoredReferenceMeta | null {
+    try {
+      if (!fs.existsSync(metaPath)) return null;
+      const parsed = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      if (!parsed || typeof parsed.ownerUid !== 'string') return null;
+      return parsed as StoredReferenceMeta;
+    } catch {
+      return null;
+    }
+  }
+
+  function deleteStoredReferenceIfOwned(rawUrlOrId: string, ownerUid: string) {
+    const match = rawUrlOrId.trim().match(SERVICE_REF_URL_REGEX);
+    const fileId = match ? match[1] : SAFE_FILE_ID_REGEX.test(rawUrlOrId.trim()) ? rawUrlOrId.trim() : '';
+    if (!fileId) return;
+    const paths = resolveStoredReferencePaths(fileId);
+    if (!paths) return;
+    const meta = readStoredReferenceMeta(paths.metaPath);
+    if (!meta || meta.ownerUid !== ownerUid) return;
+    try {
+      if (fs.existsSync(paths.filePath)) fs.unlinkSync(paths.filePath);
+    } catch {
+      // ignore unlink error
+    }
+    try {
+      if (fs.existsSync(paths.metaPath)) fs.unlinkSync(paths.metaPath);
+    } catch {
+      // ignore unlink error
+    }
+  }
+
+  // Endpoint 3.0: Upload, Fetch, Delete Handwriting Reference Images Directly in the Service
+  app.post(
+    '/api/handwriting-references',
+    requireFirebaseAuth,
+    async (req, res) => {
+      try {
+        const callerUid = String((req as any).authUser?.uid || '');
+        if (!callerUid) {
+          return res.status(401).json({ error: 'Требуется авторизация.' });
+        }
+
+        const {
+          imageBase64,
+          studentName = '',
+          classId = '',
+          previousUrl = '',
+        } = req.body || {};
+
+        if (typeof imageBase64 !== 'string' || imageBase64.trim().length < 20) {
+          return res.status(400).json({
+            error: 'Выберите фотографию эталона почерка для загрузки в сервис.',
+          });
+        }
+
+        const cleanBase64 = imageBase64
+          .trim()
+          .replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
+
+        let buffer: Buffer;
+        try {
+          buffer = Buffer.from(cleanBase64, 'base64');
+        } catch {
+          return res.status(400).json({
+            error: 'Некорректные данные изображения (ожидается Base64).',
+          });
+        }
+
+        if (!buffer || buffer.length === 0) {
+          return res.status(400).json({
+            error: 'Переданный файл изображения пуст.',
+          });
+        }
+
+        if (buffer.length > MAX_REFERENCE_IMAGE_BYTES) {
+          return res.status(413).json({
+            error: 'Размер эталонного изображения не должен превышать 5 МБ.',
+          });
+        }
+
+        const detected = detectImageTypeFromBytes(buffer);
+        if (!detected) {
+          return res.status(400).json({
+            error:
+              'Допустимы только изображения в формате JPEG, PNG или WEBP.',
+          });
+        }
+
+        const uidPrefix =
+          callerUid.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 12) || 'u';
+        const fileId = `ref_${uidPrefix}_${crypto.randomBytes(16).toString('hex')}.${detected.ext}`;
+        const paths = resolveStoredReferencePaths(fileId);
+        if (!paths) {
+          return res.status(500).json({
+            error: 'Не удалось сформировать путь хранения эталона.',
+          });
+        }
+
+        const meta: StoredReferenceMeta = {
+          ownerUid: callerUid,
+          classId:
+            typeof classId === 'string' ? classId.trim().slice(0, 128) : '',
+          studentName:
+            typeof studentName === 'string'
+              ? studentName.trim().slice(0, 120)
+              : '',
+          mimeType: detected.mimeType,
+          sizeBytes: buffer.length,
+          createdAt: new Date().toISOString(),
+        };
+
+        fs.writeFileSync(paths.filePath, buffer);
+        fs.writeFileSync(paths.metaPath, JSON.stringify(meta, null, 2), 'utf8');
+
+        if (typeof previousUrl === 'string' && previousUrl.trim()) {
+          deleteStoredReferenceIfOwned(previousUrl, callerUid);
+        }
+
+        return res.status(201).json({
+          url: `/api/handwriting-references/${fileId}`,
+          fileId,
+          mimeType: detected.mimeType,
+          sizeBytes: buffer.length,
+        });
+      } catch (error: any) {
+        console.error('Error in POST /api/handwriting-references:', error);
+        return res.status(500).json({
+          error:
+            error?.message ||
+            'Не удалось сохранить эталон почерка на сервере сервиса.',
+        });
+      }
+    }
+  );
+
+  app.get(
+    '/api/handwriting-references/:fileId',
+    requireFirebaseAuth,
+    async (req, res) => {
+      try {
+        const callerUid = String((req as any).authUser?.uid || '');
+        const paths = resolveStoredReferencePaths(String(req.params.fileId || ''));
+        if (!paths) {
+          return res.status(400).json({
+            error: 'Некорректный идентификатор файла эталона.',
+          });
+        }
+
+        if (!fs.existsSync(paths.filePath) || !fs.existsSync(paths.metaPath)) {
+          return res.status(404).json({
+            error: 'Эталон почерка не найден в хранилище сервиса.',
+          });
+        }
+
+        const meta = readStoredReferenceMeta(paths.metaPath);
+        if (!meta || meta.ownerUid !== callerUid) {
+          return res.status(403).json({
+            error: 'Нет прав доступа к этому эталону почерка.',
+          });
+        }
+
+        const buf = fs.readFileSync(paths.filePath);
+        res.setHeader('Content-Type', meta.mimeType || 'image/jpeg');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Cache-Control', 'private, max-age=3600');
+        res.setHeader('Content-Length', String(buf.length));
+        return res.status(200).end(buf);
+      } catch (error: any) {
+        console.error('Error in GET /api/handwriting-references/:fileId:', error);
+        return res.status(500).json({
+          error: 'Не удалось прочитать файл эталона почерка.',
+        });
+      }
+    }
+  );
+
+  app.delete(
+    '/api/handwriting-references/:fileId',
+    requireFirebaseAuth,
+    async (req, res) => {
+      try {
+        const callerUid = String((req as any).authUser?.uid || '');
+        const paths = resolveStoredReferencePaths(String(req.params.fileId || ''));
+        if (!paths) {
+          return res.status(400).json({
+            error: 'Некорректный идентификатор файла эталона.',
+          });
+        }
+
+        const meta = readStoredReferenceMeta(paths.metaPath);
+        if (meta && meta.ownerUid !== callerUid) {
+          return res.status(403).json({
+            error: 'Нет прав для удаления этого эталона почерка.',
+          });
+        }
+
+        if (fs.existsSync(paths.filePath)) fs.unlinkSync(paths.filePath);
+        if (fs.existsSync(paths.metaPath)) fs.unlinkSync(paths.metaPath);
+
+        return res.json({ deleted: true, fileId: paths.fileId });
+      } catch (error: any) {
+        console.error('Error in DELETE /api/handwriting-references/:fileId:', error);
+        return res.status(500).json({
+          error: 'Не удалось удалить файл эталона почерка.',
+        });
+      }
+    }
+  );
+
   interface IdentifyCandidateInput {
     studentName: string;
     handwriting_reference_url?: string;
@@ -1634,7 +1951,8 @@ ${
 
   async function identify_student(
     currentImage: { data: string; mimeType: string },
-    candidates: IdentifyCandidateInput[]
+    candidates: IdentifyCandidateInput[],
+    callerUid: string
   ) {
     const limitedCandidates = candidates.slice(0, 15);
     const loadedCandidates: Array<{
@@ -1657,6 +1975,56 @@ ${
           : '';
 
       if (refUrl) {
+        const serviceMatch = refUrl.match(SERVICE_REF_URL_REGEX);
+        if (serviceMatch) {
+          const paths = resolveStoredReferencePaths(serviceMatch[1]);
+          if (paths && fs.existsSync(paths.filePath) && fs.existsSync(paths.metaPath)) {
+            const meta = readStoredReferenceMeta(paths.metaPath);
+            if (!meta || meta.ownerUid !== callerUid) {
+              skippedReferences.push({
+                studentName: cleanName,
+                reason: 'Эталон принадлежит другому пользователю.',
+              });
+              continue;
+            }
+            try {
+              const fileBuf = fs.readFileSync(paths.filePath);
+              loadedCandidates.push({
+                studentName: cleanName,
+                referenceUrl: refUrl,
+                image: {
+                  data: fileBuf.toString('base64'),
+                  mimeType: meta.mimeType || 'image/jpeg',
+                },
+              });
+              continue;
+            } catch {
+              // Fall through to inline backup if available
+            }
+          }
+
+          if (candidate?.referenceImageBase64) {
+            const inlinePayload = resolveImagePayload(
+              candidate.referenceImageBase64,
+              candidate.referenceMimeType || 'image/jpeg'
+            );
+            if (inlinePayload) {
+              loadedCandidates.push({
+                studentName: cleanName,
+                referenceUrl: refUrl,
+                image: inlinePayload,
+              });
+              continue;
+            }
+          }
+
+          skippedReferences.push({
+            studentName: cleanName,
+            reason: 'Файл эталона не найден в сервисе — загрузите фото заново.',
+          });
+          continue;
+        }
+
         try {
           const downloaded = await fetchReferenceImageSafe(refUrl);
           loadedCandidates.push({
@@ -1666,6 +2034,20 @@ ${
           });
           continue;
         } catch (err: any) {
+          if (candidate?.referenceImageBase64) {
+            const inlinePayload = resolveImagePayload(
+              candidate.referenceImageBase64,
+              candidate.referenceMimeType || 'image/jpeg'
+            );
+            if (inlinePayload) {
+              loadedCandidates.push({
+                studentName: cleanName,
+                referenceUrl: refUrl,
+                image: inlinePayload,
+              });
+              continue;
+            }
+          }
           skippedReferences.push({
             studentName: cleanName,
             reason: err?.message || 'Не удалось загрузить эталон по ссылке',
@@ -1690,7 +2072,7 @@ ${
 
       skippedReferences.push({
         studentName: cleanName,
-        reason: 'Не указана ссылка handwriting_reference_url',
+        reason: 'Не загружен эталон почерка (handwriting_reference_url)',
       });
     }
 
@@ -1701,7 +2083,7 @@ ${
         confidencePercent: 0,
         autoSelected: false,
         reasoning:
-          'Не найдено ни одного доступного эталона почерка (handwriting_reference_url). Выберите ученика вручную.',
+          'Не найдено ни одного загруженного эталона почерка. Загрузите фото эталона в Личном кабинете или выберите ученика вручную.',
         candidateScores: [],
         skippedReferences,
       };
@@ -1807,7 +2189,8 @@ ${
       (c) => c.studentName.toLowerCase() === rawBestName.toLowerCase()
     );
     const resolvedName = matchedCandidate ? matchedCandidate.studentName : null;
-    const identified = Boolean(parsed?.identified) && Boolean(resolvedName) && confidencePercent > 0;
+    const identified =
+      Boolean(parsed?.identified) && Boolean(resolvedName) && confidencePercent > 0;
 
     const normalizedScores = Array.isArray(parsed?.candidateScores)
       ? parsed.candidateScores
@@ -1841,6 +2224,7 @@ ${
   // Endpoint 3.1: Automatic Student Identification by Handwriting (identify_student)
   app.post('/api/identify-student', requireFirebaseAuth, async (req, res) => {
     try {
+      const callerUid = String((req as any).authUser?.uid || '');
       const {
         imageBase64,
         mimeType = 'image/jpeg',
@@ -1859,11 +2243,11 @@ ${
       if (!Array.isArray(students) || students.length === 0) {
         return res.status(400).json({
           error:
-            'В списке класса нет учеников с загруженным эталоном почерка (handwriting_reference_url). Выберите ученика вручную.',
+            'В списке класса нет учеников с загруженным эталоном почерка. Загрузите фото эталона в Личном кабинете или выберите ученика вручную.',
         });
       }
 
-      const result = await identify_student(imagePayload, students);
+      const result = await identify_student(imagePayload, students, callerUid);
       return res.json(result);
     } catch (error: any) {
       console.error('Error in /api/identify-student:', error);

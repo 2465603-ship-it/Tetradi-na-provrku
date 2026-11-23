@@ -8,13 +8,17 @@ import {
   StudentRecord,
 } from '../types/notebook';
 import { safeParseJsonResponse } from '../utils/api';
+import { compressAndNormalizeImage } from '../utils/imageCompression';
+import { ServiceReferenceImage } from './ServiceReferenceImage';
 import {
+  Camera,
   Check,
   CheckCircle2,
   Cloud,
   FilePlus2,
   Fingerprint,
   HelpCircle,
+  Loader2,
   LogOut,
   Mail,
   Phone,
@@ -22,6 +26,7 @@ import {
   School,
   ShieldCheck,
   Trash2,
+  Upload,
   UserCheck,
   Users,
   Edit3,
@@ -56,6 +61,18 @@ interface TeacherCabinetViewProps {
     classItem: SchoolClassItem,
     studentName: string,
     handwritingReferenceUrl: string
+  ) => Promise<void>;
+  authToken?: string;
+  onUploadStudentReferenceFile?: (
+    classItem: SchoolClassItem,
+    studentName: string,
+    imageBase64: string,
+    previousUrl?: string
+  ) => Promise<string>;
+  onDeleteStudentReferenceFile?: (
+    classItem: SchoolClassItem,
+    studentName: string,
+    currentUrl?: string
   ) => Promise<void>;
   onConnectGoogleCloud: () => Promise<void>;
   onLogout: () => Promise<void>;
@@ -101,6 +118,9 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
   parentContacts = {},
   onSaveParentContact,
   onSaveStudentReferenceUrl,
+  authToken,
+  onUploadStudentReferenceFile,
+  onDeleteStudentReferenceFile,
   onConnectGoogleCloud,
   onLogout,
 }) => {
@@ -154,11 +174,41 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
   const [draftParentEmail, setDraftParentEmail] = useState('');
   const [parentFormError, setParentFormError] = useState<string | null>(null);
 
-  // Inline handwriting_reference_url editor for a student in the class roster
+  // Inline direct service upload panel for student handwriting reference
   const [editingRefKey, setEditingRefKey] = useState<string | null>(null);
-  const [draftReferenceUrl, setDraftReferenceUrl] = useState('');
   const [referenceFormError, setReferenceFormError] = useState<string | null>(null);
   const [isSavingReferenceUrl, setIsSavingReferenceUrl] = useState(false);
+  const [draggingRefKey, setDraggingRefKey] = useState<string | null>(null);
+
+  const handleUploadReferencePhoto = async (
+    cls: SchoolClassItem,
+    studentName: string,
+    file: File | Blob,
+    currentUrl?: string
+  ) => {
+    setReferenceFormError(null);
+    setIsSavingReferenceUrl(true);
+    try {
+      const normalized = await compressAndNormalizeImage(file, 1400, 0.86);
+      if (onUploadStudentReferenceFile) {
+        await onUploadStudentReferenceFile(
+          cls,
+          studentName,
+          normalized.dataUrl,
+          currentUrl
+        );
+      } else {
+        await onSaveStudentReferenceUrl?.(cls, studentName, '');
+      }
+    } catch (err: any) {
+      setReferenceFormError(
+        err?.message ||
+          'Не удалось загрузить фото эталона почерка в сервис.'
+      );
+    } finally {
+      setIsSavingReferenceUrl(false);
+    }
+  };
 
   // Step 1: Request SMS code
   const handleSendOtp = async (e: React.FormEvent) => {
@@ -1054,6 +1104,17 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                         );
                         const savedRefUrl =
                           matchedStudentRecord?.handwriting_reference_url || '';
+                        let localCachedPreview: string | null = null;
+                        try {
+                          localCachedPreview = localStorage.getItem(
+                            `tetrad_plus_hw_ref:${stuName.trim().toLowerCase()}`
+                          );
+                        } catch {
+                          // ignore storage errors
+                        }
+                        const hasStoredReference = Boolean(
+                          savedRefUrl || localCachedPreview
+                        );
                         const isEditingRef = editingRefKey === rowKey;
 
                         return (
@@ -1077,10 +1138,10 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                                         : ''}
                                     </div>
                                   )}
-                                {savedRefUrl && (
+                                {hasStoredReference && (
                                   <div className="text-[11px] text-emerald-700 pl-5 truncate flex items-center gap-1">
                                     <Fingerprint className="w-3 h-3 shrink-0" />
-                                    <span>Эталон почерка сохранён</span>
+                                    <span>Эталон почерка сохранён в сервисе</span>
                                   </div>
                                 )}
                               </div>
@@ -1095,19 +1156,18 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                                     } else {
                                       setEditingRefKey(rowKey);
                                       setEditingParentKey(null);
-                                      setDraftReferenceUrl(savedRefUrl);
                                       setReferenceFormError(null);
                                     }
                                   }}
                                   className={`flex items-center gap-1 font-medium whitespace-nowrap cursor-pointer ${
-                                    savedRefUrl
+                                    hasStoredReference
                                       ? 'text-emerald-700 hover:text-emerald-900'
                                       : 'text-slate-600 hover:text-slate-900'
                                   }`}
                                 >
                                   <Fingerprint className="w-3 h-3" />
                                   <span>
-                                    {savedRefUrl ? 'Эталон почерка' : '+ Эталон фото'}
+                                    {hasStoredReference ? 'Эталон почерка' : '+ Эталон фото'}
                                   </span>
                                 </button>
                                 <button
@@ -1157,101 +1217,166 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                             </div>
 
                             {isEditingRef && (
-                              <form
-                                onSubmit={async (e) => {
+                              <div
+                                onDragOver={(e) => {
                                   e.preventDefault();
-                                  const raw = draftReferenceUrl.trim();
-                                  if (raw) {
-                                    try {
-                                      const parsed = new URL(raw);
-                                      if (
-                                        parsed.protocol !== 'https:' &&
-                                        parsed.protocol !== 'http:'
-                                      ) {
-                                        throw new Error('protocol');
-                                      }
-                                    } catch {
-                                      setReferenceFormError(
-                                        'Укажите корректную ссылку на изображение эталона почерка (начинается с https:// или http://).'
-                                      );
-                                      return;
-                                    }
-                                  }
-                                  setIsSavingReferenceUrl(true);
-                                  setReferenceFormError(null);
-                                  try {
-                                    await onSaveStudentReferenceUrl?.(
+                                  setDraggingRefKey(rowKey);
+                                }}
+                                onDragLeave={() => setDraggingRefKey(null)}
+                                onDrop={(e) => {
+                                  e.preventDefault();
+                                  setDraggingRefKey(null);
+                                  const dropped = e.dataTransfer.files?.[0];
+                                  if (dropped && dropped.type.startsWith('image/')) {
+                                    handleUploadReferencePhoto(
                                       cls,
                                       stuName,
-                                      raw
+                                      dropped,
+                                      savedRefUrl
                                     );
-                                    setEditingRefKey(null);
-                                  } catch (err: any) {
-                                    setReferenceFormError(
-                                      err?.message ||
-                                        'Не удалось сохранить ссылку на эталон почерка.'
-                                    );
-                                  } finally {
-                                    setIsSavingReferenceUrl(false);
                                   }
                                 }}
-                                className="mt-2 p-2.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2"
+                                className={`mt-2 p-3 border rounded-lg space-y-2.5 transition-colors ${
+                                  draggingRefKey === rowKey
+                                    ? 'bg-sky-50 border-sky-400'
+                                    : 'bg-slate-50 border-slate-200'
+                                }`}
                               >
-                                <label
-                                  htmlFor={`ref-url-${rowKey}`}
-                                  className="block text-[11px] font-medium text-slate-700"
-                                >
-                                  Ссылка на фото эталона почерка (handwriting_reference_url):
-                                </label>
-                                <div className="flex items-center gap-2">
-                                  <input
-                                    id={`ref-url-${rowKey}`}
-                                    type="url"
-                                    value={draftReferenceUrl}
-                                    onChange={(e) =>
-                                      setDraftReferenceUrl(e.target.value)
-                                    }
-                                    placeholder="https://example.ru/handwriting-sample.jpg"
-                                    className="flex-1 px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-600"
-                                  />
-                                  {draftReferenceUrl.trim() && (
-                                    <img
-                                      src={draftReferenceUrl.trim()}
-                                      alt={`Эталон почерка ${stuName}`}
-                                      referrerPolicy="no-referrer"
-                                      className="w-8 h-8 rounded object-cover border border-slate-300 shrink-0 bg-white"
-                                      onError={(ev) => {
-                                        (ev.currentTarget as HTMLImageElement).style.display =
-                                          'none';
-                                      }}
-                                    />
-                                  )}
-                                </div>
-                                {referenceFormError && (
-                                  <p className="text-[11px] text-red-600">
-                                    {referenceFormError}
-                                  </p>
-                                )}
-                                <div className="flex items-center justify-end gap-2">
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="text-[11px] font-semibold text-slate-800">
+                                    Фотография эталона почерка ученика (хранится в сервисе)
+                                  </span>
                                   <button
                                     type="button"
                                     onClick={() => {
                                       setEditingRefKey(null);
                                       setReferenceFormError(null);
                                     }}
-                                    className="px-2 py-1 text-[11px] text-slate-600 hover:text-slate-900 cursor-pointer"
+                                    className="text-[11px] text-slate-500 hover:text-slate-900 cursor-pointer"
                                   >
-                                    Отмена
-                                  </button>
-                                  <button
-                                    type="submit"
-                                    disabled={isSavingReferenceUrl}
-                                    className="px-2.5 py-1 text-[11px] font-semibold bg-slate-900 text-white rounded-md hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
-                                  >
-                                    {isSavingReferenceUrl ? 'Сохраняем...' : 'Сохранить'}
+                                    Свернуть
                                   </button>
                                 </div>
-                              </form>
+
+                                <p className="text-[11px] text-slate-500 leading-snug">
+                                  Загрузите снимок тетради с устройства или сфотографируйте камерой — файл сохранится в сервисе и будет использоваться для автоматического распознавания ученика.
+                                </p>
+
+                                {hasStoredReference && (
+                                  <div className="flex items-center gap-2.5 p-2 bg-white border border-slate-200 rounded-lg">
+                                    <ServiceReferenceImage
+                                      src={savedRefUrl || localCachedPreview}
+                                      fallbackSrc={localCachedPreview}
+                                      authToken={authToken}
+                                      alt={`Эталон почерка ${stuName}`}
+                                      className="w-12 h-12 rounded object-cover border border-slate-200 shrink-0"
+                                    />
+                                    <div className="min-w-0 flex-1">
+                                      <div className="text-[11px] font-semibold text-emerald-800 truncate">
+                                        Эталон загружен в сервис
+                                      </div>
+                                      <div className="text-[10px] text-slate-500 truncate">
+                                        Готов к сравнению почерка ученика «{stuName}»
+                                      </div>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      disabled={isSavingReferenceUrl}
+                                      onClick={async () => {
+                                        setIsSavingReferenceUrl(true);
+                                        setReferenceFormError(null);
+                                        try {
+                                          await onDeleteStudentReferenceFile?.(
+                                            cls,
+                                            stuName,
+                                            savedRefUrl
+                                          );
+                                        } catch (err: any) {
+                                          setReferenceFormError(
+                                            err?.message ||
+                                              'Не удалось удалить эталон.'
+                                          );
+                                        } finally {
+                                          setIsSavingReferenceUrl(false);
+                                        }
+                                      }}
+                                      title="Удалить эталон"
+                                      className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-red-700 hover:bg-red-50 rounded border border-red-200 disabled:opacity-50 cursor-pointer shrink-0"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                      <span>Удалить</span>
+                                    </button>
+                                  </div>
+                                )}
+
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-white rounded-md cursor-pointer">
+                                    {isSavingReferenceUrl ? (
+                                      <>
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                        <span>Загружаем в сервис...</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Upload className="w-3.5 h-3.5" />
+                                        <span>
+                                          {hasStoredReference
+                                            ? 'Загрузить новое фото'
+                                            : 'Загрузить фото эталона'}
+                                        </span>
+                                      </>
+                                    )}
+                                    <input
+                                      type="file"
+                                      accept="image/*"
+                                      disabled={isSavingReferenceUrl}
+                                      className="hidden"
+                                      onChange={(ev) => {
+                                        const picked = ev.target.files?.[0];
+                                        if (picked) {
+                                          handleUploadReferencePhoto(
+                                            cls,
+                                            stuName,
+                                            picked,
+                                            savedRefUrl
+                                          );
+                                        }
+                                        ev.target.value = '';
+                                      }}
+                                    />
+                                  </label>
+
+                                  <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium bg-white hover:bg-slate-100 text-slate-800 border border-slate-300 rounded-md cursor-pointer">
+                                    <Camera className="w-3.5 h-3.5 text-red-600" />
+                                    <span>Снять на камеру</span>
+                                    <input
+                                      type="file"
+                                      accept="image/*"
+                                      capture="environment"
+                                      disabled={isSavingReferenceUrl}
+                                      className="hidden"
+                                      onChange={(ev) => {
+                                        const captured = ev.target.files?.[0];
+                                        if (captured) {
+                                          handleUploadReferencePhoto(
+                                            cls,
+                                            stuName,
+                                            captured,
+                                            savedRefUrl
+                                          );
+                                        }
+                                        ev.target.value = '';
+                                      }}
+                                    />
+                                  </label>
+                                </div>
+
+                                {referenceFormError && (
+                                  <p className="text-[11px] text-red-600">
+                                    {referenceFormError}
+                                  </p>
+                                )}
+                              </div>
                             )}
 
                             {isEditingParent && (

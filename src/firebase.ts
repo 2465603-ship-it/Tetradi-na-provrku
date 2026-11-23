@@ -393,23 +393,35 @@ export function subscribeToTeacherClasses(
 }
 
 // Student Firestore Operations (students collection with handwriting_reference_url)
-export function validateHttpUrl(rawUrl: string): string {
+export const SERVICE_HANDWRITING_REF_REGEX =
+  /^\/api\/handwriting-references\/[a-zA-Z0-9_\-]+\.(jpg|png|webp)$/;
+
+export function validateHandwritingReferenceValue(rawUrl: string): string {
   const trimmed = (rawUrl || '').trim();
   if (!trimmed) return '';
   if (trimmed.length > 2048) {
-    throw new Error('Ссылка на эталон почерка не должна превышать 2048 символов.');
+    throw new Error(
+      'Адрес эталона почерка не должен превышать 2048 символов.'
+    );
+  }
+  if (SERVICE_HANDWRITING_REF_REGEX.test(trimmed)) {
+    return trimmed;
   }
   let parsed: URL;
   try {
     parsed = new URL(trimmed);
   } catch {
-    throw new Error('Введите корректную URL-ссылку (начинающуюся с https:// или http://).');
+    throw new Error(
+      'Загрузите изображение эталона в сервис или укажите корректную ссылку https:// / http://.'
+    );
   }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
     throw new Error('Допустимы только ссылки с протоколом https:// или http://.');
   }
   return parsed.toString();
 }
+
+export const validateHttpUrl = validateHandwritingReferenceValue;
 
 export function buildStudentDocId(classId: string, studentName: string): string {
   const safeClass = sanitizeId(classId).slice(0, 48);
@@ -430,7 +442,7 @@ export function sanitizeStudentPayload(
   const safeUid = sanitizeId(uid);
   const safeClassId = sanitizeId(student.classId);
   const studentName = (student.studentName || '').trim().slice(0, 120);
-  const handwriting_reference_url = validateHttpUrl(
+  const handwriting_reference_url = validateHandwritingReferenceValue(
     student.handwriting_reference_url || ''
   );
 
@@ -532,6 +544,10 @@ export function clearGmailAccessToken(): void {
   cachedGmailAccessToken = null;
 }
 
+export function getFirebaseProjectId(): string {
+  return resolvedFirebaseConfig.projectId || '';
+}
+
 // Auth helpers
 export async function signInTeacherWithGoogle() {
   if (!auth) {
@@ -550,9 +566,12 @@ export async function signInTeacherWithGoogle() {
   const result = await signInWithPopup(auth, provider);
   const credential = GoogleAuthProvider.credentialFromResult(result);
   cachedGmailAccessToken = credential?.accessToken || null;
+  const idToken = await result.user.getIdToken();
 
   return {
     user: result.user,
+    idToken,
+    refreshToken: result.user.refreshToken || '',
     accessToken: cachedGmailAccessToken,
   };
 }

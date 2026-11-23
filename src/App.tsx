@@ -37,7 +37,7 @@ import {
   subscribeToTeacherClasses,
   subscribeToTeacherStudents,
   upsertStudentInFirestore,
-  validateHttpUrl,
+  validateHandwritingReferenceValue,
   signInTeacherWithGoogle,
   signOutTeacher,
 } from './firebase';
@@ -295,6 +295,27 @@ export default function App() {
 
       if (user) {
         try {
+          const freshIdToken = await user.getIdToken();
+          setAuthSession((prev) => {
+            if (prev && prev.user.uid === user.uid) {
+              return {
+                ...prev,
+                idToken: freshIdToken || prev.idToken,
+              };
+            }
+            return {
+              user: {
+                uid: user.uid,
+                email: user.email || '',
+                displayName: user.displayName || undefined,
+                emailVerified: Boolean(user.emailVerified),
+              },
+              idToken: freshIdToken,
+              refreshToken: user.refreshToken || '',
+            };
+          });
+          setIsCheckingSession(false);
+
           const remoteProfile = await fetchTeacherProfileFromFirestore(user.uid);
           if (remoteProfile) {
             setTeacherProfile(remoteProfile);
@@ -632,7 +653,7 @@ export default function App() {
     if (!cleanName) {
       throw new Error('Укажите имя ученика.');
     }
-    const validatedUrl = validateHttpUrl(rawReferenceUrl);
+    const validatedUrl = validateHandwritingReferenceValue(rawReferenceUrl);
     const activeUid =
       firebaseUser?.uid || teacherProfile?.ownerId || 'default_teacher';
     const studentDocId = buildStudentDocId(classItem.id, cleanName);
@@ -688,8 +709,8 @@ export default function App() {
 
     setApprovalBanner(
       validatedUrl
-        ? `Эталон почерка для ${cleanName} сохранён.`
-        : `Ссылка на эталон почерка для ${cleanName} очищена.`
+        ? `Эталон почерка для ${cleanName} загружен и сохранён в сервисе.`
+        : `Эталон почерка для ${cleanName} удалён.`
     );
     setTimeout(() => setApprovalBanner(null), 3500);
   };
@@ -790,8 +811,15 @@ export default function App() {
     }
   };
 
-  const handleAuthSuccess = (session: AuthSession) => {
+  const handleAuthSuccess = (
+    session: AuthSession,
+    googleGmailToken?: string | null
+  ) => {
     setAuthSession(session);
+    if (googleGmailToken) {
+      setGmailAccessToken(googleGmailToken);
+      setGmailSenderEmail(session.user.email || null);
+    }
     if (!teacherProfile) {
       setTeacherProfile({
         ownerId: session.user.uid,
@@ -819,7 +847,7 @@ export default function App() {
     setGmailAccessToken(null);
     setGmailSenderEmail(null);
     setIsConfirmingGmailSend(false);
-    if (firebaseUser) {
+    if (auth?.currentUser || firebaseUser) {
       await signOutTeacher();
     }
   };
@@ -1098,7 +1126,29 @@ export default function App() {
     };
 
     let activeToken = authSession.idToken;
+    if (auth?.currentUser && auth.currentUser.uid === authSession.user.uid) {
+      try {
+        activeToken = await auth.currentUser.getIdToken();
+      } catch {
+        // Fallback to cached idToken
+      }
+    }
     let response = activeToken ? await makeRequest(activeToken) : null;
+
+    if ((!response || response.status === 401) && auth?.currentUser) {
+      try {
+        const sdkFreshToken = await auth.currentUser.getIdToken(true);
+        if (sdkFreshToken) {
+          setAuthSession((prev) =>
+            prev ? { ...prev, idToken: sdkFreshToken } : prev
+          );
+          activeToken = sdkFreshToken;
+          response = await makeRequest(activeToken);
+        }
+      } catch {
+        // Fallback to REST refresh below
+      }
+    }
 
     if ((!response || response.status === 401) && authSession.refreshToken) {
       try {
@@ -1132,6 +1182,96 @@ export default function App() {
     }
 
     return response;
+  };
+
+  const handleUploadStudentReferenceFile = async (
+    classItem: SchoolClassItem,
+    studentName: string,
+    imageBase64: string,
+    previousUrl?: string
+  ): Promise<string> => {
+    const cleanName = studentName.trim();
+    if (!cleanName) {
+      throw new Error('Укажите имя ученика.');
+    }
+    const existingRecord = studentsRecords.find(
+      (sr) =>
+        sr.studentName.trim().toLowerCase() === cleanName.toLowerCase() &&
+        (!sr.classId || sr.classId === classItem.id)
+    );
+    const prevRefUrl = previousUrl ?? existingRecord?.handwriting_reference_url ?? '';
+
+    const response = await authorizedFetch('/api/handwriting-references', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        imageBase64,
+        studentName: cleanName,
+        classId: classItem.id,
+        previousUrl: prevRefUrl,
+      }),
+    });
+
+    if (!response) {
+      throw new Error('Сессия истекла. Войдите в аккаунт снова, чтобы загрузить эталон.');
+    }
+
+    const data = await safeParseJsonResponse(response);
+    if (!response.ok || !data?.url) {
+      throw new Error(
+        data?.error || 'Не удалось сохранить фото эталона почерка на сервере сервиса.'
+      );
+    }
+
+    try {
+      localStorage.setItem(
+        `tetrad_plus_hw_ref:${cleanName.toLowerCase()}`,
+        imageBase64
+      );
+    } catch {
+      // ignore localStorage quota limits
+    }
+
+    await handleSaveStudentReferenceUrl(classItem, cleanName, String(data.url));
+    return String(data.url);
+  };
+
+  const handleDeleteStudentReferenceFile = async (
+    classItem: SchoolClassItem,
+    studentName: string,
+    currentUrl?: string
+  ): Promise<void> => {
+    const cleanName = studentName.trim();
+    if (!cleanName) return;
+
+    const existingRecord = studentsRecords.find(
+      (sr) =>
+        sr.studentName.trim().toLowerCase() === cleanName.toLowerCase() &&
+        (!sr.classId || sr.classId === classItem.id)
+    );
+    const targetUrl = (
+      currentUrl ??
+      existingRecord?.handwriting_reference_url ??
+      ''
+    ).trim();
+
+    if (targetUrl.startsWith('/api/handwriting-references/')) {
+      try {
+        await authorizedFetch(targetUrl, { method: 'DELETE' });
+      } catch {
+        // ignore network error if file was already cleaned up
+      }
+    }
+
+    try {
+      localStorage.removeItem(`tetrad_plus_hw_ref:${cleanName.toLowerCase()}`);
+    } catch {
+      // ignore localStorage errors
+    }
+
+    await handleSaveStudentReferenceUrl(classItem, cleanName, '');
   };
 
   const handleOpenParentReportModal = (targetSub?: NotebookSubmission) => {
@@ -1639,19 +1779,19 @@ export default function App() {
                 <p className="text-sm text-slate-600 max-w-2xl">
                   Для работы с фотографиями школьных тетрадей, журналом оценок,
                   личным кабинетом классов и карточками работы над ошибками
-                  необходимо выполнить <strong>Вход</strong> или{' '}
-                  <strong>Регистрацию</strong> по email и паролю в боковой
-                  панели слева.
+                  войдите в боковой панели слева через{' '}
+                  <strong>Google-аккаунт</strong> или по{' '}
+                  <strong>Email и паролю</strong> Firebase.
                 </p>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 text-xs text-slate-700">
                 <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
                   <div className="font-semibold text-slate-900">
-                    1. Firebase Auth REST API
+                    1. Вход через Google или Email
                   </div>
                   <p className="text-slate-600">
-                    Вход и регистрация выполняются через серверные эндпоинты с
-                    ключом из переменных окружения (.env).
+                    Вход через Google работает сразу после запуска и открывает
+                    синхронизацию с Firestore и отправку PDF-отчётов через Gmail.
                   </p>
                 </div>
                 <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
@@ -1696,6 +1836,9 @@ export default function App() {
             parentContacts={parentContactsByStudent}
             onSaveParentContact={handleSaveParentContact}
             onSaveStudentReferenceUrl={handleSaveStudentReferenceUrl}
+            authToken={authSession.idToken}
+            onUploadStudentReferenceFile={handleUploadStudentReferenceFile}
+            onDeleteStudentReferenceFile={handleDeleteStudentReferenceFile}
             onConnectGoogleCloud={handleConnectGoogleCloud}
             onLogout={handleLogoutCabinet}
           />
@@ -2943,6 +3086,8 @@ export default function App() {
           activeStudentName={currentSubmission?.studentName}
           activeSubject={currentSubmission?.subject}
           authToken={authSession.idToken}
+          onUploadStudentReferenceFile={handleUploadStudentReferenceFile}
+          onDeleteStudentReferenceFile={handleDeleteStudentReferenceFile}
           onAuthExpired={handleEmailLogout}
         />
       )}

@@ -150,10 +150,10 @@
         },
         "handwriting_reference_url": {
           "type": "string",
-          "description": "HTTPS/HTTP URL pointing to the student's reference handwriting photo (empty string if not yet uploaded).",
+          "description": "Service-hosted path (/api/handwriting-references/...) or HTTP(S) URL pointing to the student's reference handwriting photo (empty string if not yet uploaded).",
           "minLength": 0,
           "maxLength": 2048,
-          "pattern": "^(|https?://.+)$"
+          "pattern": "^(|/api/handwriting-references/[a-zA-Z0-9_\\-]+\\.(jpg|png|webp)|https?://.+)$"
         },
         "createdAt": {
           "type": "string",

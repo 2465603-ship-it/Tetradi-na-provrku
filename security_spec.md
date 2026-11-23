@@ -14,7 +14,7 @@
 4. **Student Roster & Reference Handwriting Protection (`/students/{studentId}`)**:
    - Each `Student` document requires `isVerifiedUser()`, `isValidId(studentId)`, and `incoming().ownerId == request.auth.uid`.
    - Creation verifies that the referenced `/classes/$(incoming().classId)` document exists and belongs to `request.auth.uid`.
-   - `handwriting_reference_url` is strictly bounded (`<= 2048` chars) and must be either `''` or a valid `http(s)://` URL (blocking `javascript:`, `data:`, or oversized base64 blobs).
+   - `handwriting_reference_url` is strictly bounded (`<= 2048` chars) and must be `''`, a service-hosted path matching `^/api/handwriting-references/[a-zA-Z0-9_\-]+\.(jpg|png|webp)$`, or a valid `http(s)://` URL (blocking `javascript:`, `data:`, path traversal, or oversized base64 blobs).
    - `list`, `get`, `update`, and `delete` are scoped exclusively to `ownerId == request.auth.uid`, with `ownerId`, `classId`, and `createdAt` immutable on update.
 
 ## 2. The "Dirty Dozen" Payloads

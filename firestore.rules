@@ -156,7 +156,11 @@ service cloud.firestore {
       data.handwriting_reference_url is string &&
       data.handwriting_reference_url.size() >= 0 &&
       data.handwriting_reference_url.size() <= 2048 &&
-      (data.handwriting_reference_url == '' || data.handwriting_reference_url.matches('^https?://.+')) &&
+      (
+        data.handwriting_reference_url == '' ||
+        data.handwriting_reference_url.matches('^/api/handwriting-references/[a-zA-Z0-9_\\-]+\\.(jpg|png|webp)$') ||
+        data.handwriting_reference_url.matches('^https?://.+')
+      ) &&
       data.createdAt is timestamp &&
       data.updatedAt is timestamp;
     }
