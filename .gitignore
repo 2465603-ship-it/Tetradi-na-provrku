@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+firebase-applet-config.json
+.env*.local
+*.pem
+*.key
+*service-account*.json
+*serviceAccount*.json
+google-services.json
+GoogleService-Info.plist

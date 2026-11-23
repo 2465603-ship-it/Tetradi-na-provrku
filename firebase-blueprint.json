@@ -122,6 +122,58 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "Student": {
+      "title": "Student",
+      "description": "Student record owned by a teacher, including handwriting reference photo URL for Gemini handwriting identification.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID of the teacher who owns this student record.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "classId": {
+          "type": "string",
+          "description": "ID of the parent SchoolClass document.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentName": {
+          "type": "string",
+          "description": "Full name of the student.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "handwriting_reference_url": {
+          "type": "string",
+          "description": "HTTPS/HTTP URL pointing to the student's reference handwriting photo (empty string if not yet uploaded).",
+          "minLength": 0,
+          "maxLength": 2048,
+          "pattern": "^(|https?://.+)$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of student record creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last student record update."
+        }
+      },
+      "required": [
+        "ownerId",
+        "classId",
+        "studentName",
+        "handwriting_reference_url",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -132,6 +184,11 @@
     "/classes/{classId}": {
       "schema": { "$ref": "#/entities/SchoolClass" },
       "description": "School classes owned by teachers."
+    },
+    "/students/{studentId}": {
+      "schema": { "$ref": "#/entities/Student" },
+      "description": "Students owned by teachers, storing handwriting_reference_url for handwriting identification."
     }
   }
 }
+

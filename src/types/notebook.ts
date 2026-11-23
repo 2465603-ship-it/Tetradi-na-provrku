@@ -103,6 +103,33 @@ export interface SchoolClassItem {
   studentsList: string; // newline-separated student names
 }
 
+export interface StudentRecord {
+  id: string;
+  ownerId: string;
+  classId: string;
+  studentName: string;
+  handwriting_reference_url: string;
+}
+
+export interface StudentIdentificationCandidateScore {
+  studentName: string;
+  confidencePercent: number;
+}
+
+export interface StudentIdentificationResult {
+  identified: boolean;
+  studentName: string | null;
+  confidencePercent: number;
+  autoSelected: boolean;
+  reasoning: string;
+  candidateScores?: StudentIdentificationCandidateScore[];
+  skippedReferences?: Array<{
+    studentName: string;
+    reason: string;
+  }>;
+  modelUsed?: string;
+}
+
 export interface AuthUser {
   uid: string;
   email: string;
@@ -115,3 +142,4 @@ export interface AuthSession {
   idToken: string;
   refreshToken: string;
 }
+

@@ -1,0 +1,11 @@
+{
+  "projectId": "MY_FIREBASE_PROJECT_ID",
+  "appId": "MY_FIREBASE_APP_ID",
+  "apiKey": "MY_FIREBASE_WEB_API_KEY",
+  "authDomain": "MY_FIREBASE_AUTH_DOMAIN",
+  "storageBucket": "MY_FIREBASE_STORAGE_BUCKET",
+  "messagingSenderId": "MY_FIREBASE_MESSAGING_SENDER_ID",
+  "measurementId": "",
+  "oAuthClientId": "MY_GOOGLE_OAUTH_CLIENT_ID",
+  "recaptchaSiteKey": ""
+}

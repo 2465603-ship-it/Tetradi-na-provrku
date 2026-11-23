@@ -10,6 +10,7 @@ import {
   SchoolClassItem,
   AuthSession,
   ParentContact,
+  StudentRecord,
 } from './types/notebook';
 import {
   INITIAL_SUBMISSIONS,
@@ -25,13 +26,18 @@ import { AuthSidebar } from './components/AuthSidebar';
 import { safeParseJsonResponse } from './utils/api';
 import {
   auth,
+  buildStudentDocId,
   clearGmailAccessToken,
   fetchTeacherProfileFromFirestore,
   upsertTeacherProfileInFirestore,
   createClassInFirestore,
+  ensureClassExistsInFirestore,
   updateClassInFirestore,
   deleteClassFromFirestore,
   subscribeToTeacherClasses,
+  subscribeToTeacherStudents,
+  upsertStudentInFirestore,
+  validateHttpUrl,
   signInTeacherWithGoogle,
   signOutTeacher,
 } from './firebase';
@@ -130,6 +136,19 @@ export default function App() {
     return [];
   });
 
+  const [studentsRecords, setStudentsRecords] = useState<StudentRecord[]>(() => {
+    try {
+      const saved = localStorage.getItem('tetrad_plus_students');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return [];
+  });
+
   // Persist local cabinet changes and teacher-created notebook submissions
   useEffect(() => {
     try {
@@ -167,6 +186,17 @@ export default function App() {
       // ignore
     }
   }, [classes]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'tetrad_plus_students',
+        JSON.stringify(studentsRecords)
+      );
+    } catch {
+      // ignore
+    }
+  }, [studentsRecords]);
 
   // Email/Password Firebase REST API Session State
   const [authSession, setAuthSession] = useState<AuthSession | null>(() => {
@@ -246,16 +276,21 @@ export default function App() {
     };
   }, []);
 
-  // Listen to optional client Firebase Auth state & sync Firestore profile + classes when configured
+  // Listen to optional client Firebase Auth state & sync Firestore profile + classes + students when configured
   useEffect(() => {
     if (!auth) return;
     let unsubscribeClasses: (() => void) | null = null;
+    let unsubscribeStudents: (() => void) | null = null;
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
       setFirebaseUser(user);
       if (unsubscribeClasses) {
         unsubscribeClasses();
         unsubscribeClasses = null;
+      }
+      if (unsubscribeStudents) {
+        unsubscribeStudents();
+        unsubscribeStudents = null;
       }
 
       if (user) {
@@ -275,6 +310,15 @@ export default function App() {
               }
             }
           );
+
+          unsubscribeStudents = subscribeToTeacherStudents(
+            user.uid,
+            (remoteStudents) => {
+              if (remoteStudents.length > 0) {
+                setStudentsRecords(remoteStudents);
+              }
+            }
+          );
         } catch (err) {
           console.warn('Firestore profile sync skipped:', err);
         }
@@ -288,6 +332,7 @@ export default function App() {
     return () => {
       unsubscribeAuth();
       if (unsubscribeClasses) unsubscribeClasses();
+      if (unsubscribeStudents) unsubscribeStudents();
     };
   }, []);
 
@@ -576,6 +621,77 @@ export default function App() {
         console.warn('Could not delete class in Firestore:', e);
       }
     }
+  };
+
+  const handleSaveStudentReferenceUrl = async (
+    classItem: SchoolClassItem,
+    studentName: string,
+    rawReferenceUrl: string
+  ) => {
+    const cleanName = studentName.trim();
+    if (!cleanName) {
+      throw new Error('Укажите имя ученика.');
+    }
+    const validatedUrl = validateHttpUrl(rawReferenceUrl);
+    const activeUid =
+      firebaseUser?.uid || teacherProfile?.ownerId || 'default_teacher';
+    const studentDocId = buildStudentDocId(classItem.id, cleanName);
+
+    const record: StudentRecord = {
+      id: studentDocId,
+      ownerId: activeUid,
+      classId: classItem.id,
+      studentName: cleanName,
+      handwriting_reference_url: validatedUrl,
+    };
+
+    setStudentsRecords((prev) => {
+      const idx = prev.findIndex(
+        (s) =>
+          s.id === studentDocId ||
+          (s.classId === classItem.id &&
+            s.studentName.trim().toLowerCase() === cleanName.toLowerCase())
+      );
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = record;
+        return next;
+      }
+      return [record, ...prev];
+    });
+
+    if (firebaseUser) {
+      try {
+        await upsertTeacherProfileInFirestore(firebaseUser.uid, {
+          fullName: teacherProfile?.fullName || TEACHER_PROFILE.name,
+          phone: teacherProfile?.phone || '+7 (916) 450-12-89',
+          schoolName: teacherProfile?.schoolName || TEACHER_PROFILE.school,
+          qualification: teacherProfile?.qualification || TEACHER_PROFILE.role,
+        });
+        await ensureClassExistsInFirestore(firebaseUser.uid, classItem.id, {
+          name: classItem.name,
+          gradeLevel: classItem.gradeLevel,
+          academicYear: classItem.academicYear,
+          defaultRuling: classItem.defaultRuling,
+          studentCount: classItem.studentCount,
+          studentsList: classItem.studentsList,
+        });
+        await upsertStudentInFirestore(firebaseUser.uid, studentDocId, {
+          classId: classItem.id,
+          studentName: cleanName,
+          handwriting_reference_url: validatedUrl,
+        });
+      } catch (e) {
+        console.warn('Could not sync student handwriting reference to Firestore:', e);
+      }
+    }
+
+    setApprovalBanner(
+      validatedUrl
+        ? `Эталон почерка для ${cleanName} сохранён.`
+        : `Ссылка на эталон почерка для ${cleanName} очищена.`
+    );
+    setTimeout(() => setApprovalBanner(null), 3500);
   };
 
   const handleCreateNotebookForStudent = (
@@ -1566,6 +1682,7 @@ export default function App() {
           <TeacherCabinetView
             teacherProfile={teacherProfile}
             classes={classes}
+            studentsRecords={studentsRecords}
             isFirebaseAuthenticated={Boolean(firebaseUser || authSession)}
             firebaseEmail={
               authSession?.user.email || firebaseUser?.email || null
@@ -1578,6 +1695,7 @@ export default function App() {
             onCreateNotebookForStudent={handleCreateNotebookForStudent}
             parentContacts={parentContactsByStudent}
             onSaveParentContact={handleSaveParentContact}
+            onSaveStudentReferenceUrl={handleSaveStudentReferenceUrl}
             onConnectGoogleCloud={handleConnectGoogleCloud}
             onLogout={handleLogoutCabinet}
           />
@@ -2818,6 +2936,7 @@ export default function App() {
           onClose={() => setIsPhotoModalOpen(false)}
           onAddCheckedSubmission={handleAddCheckedSubmission}
           classes={classes}
+          studentsRecords={studentsRecords}
           activeClassGroup={
             classFilter !== 'all' ? classFilter : currentSubmission?.classGroup
           }

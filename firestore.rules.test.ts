@@ -94,4 +94,19 @@ export const DIRTY_DOZEN_CASES: DirtyDozenCase[] = [
     operation: 'create',
     expectedOutcome: 'PERMISSION_DENIED',
   },
+  {
+    id: 13,
+    name: 'Invalid URL Scheme or Oversized Payload in handwriting_reference_url',
+    collection: '/students/stu_1',
+    operation: 'create',
+    expectedOutcome: 'PERMISSION_DENIED',
+  },
+  {
+    id: 14,
+    name: 'Cross-Teacher Student List or Orphaned Class Attachment',
+    collection: '/students',
+    operation: 'list',
+    expectedOutcome: 'PERMISSION_DENIED',
+  },
 ];
+

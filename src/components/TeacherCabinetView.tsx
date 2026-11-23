@@ -5,6 +5,7 @@ import {
   PaperRulingType,
   SubjectType,
   ParentContact,
+  StudentRecord,
 } from '../types/notebook';
 import { safeParseJsonResponse } from '../utils/api';
 import {
@@ -12,6 +13,7 @@ import {
   CheckCircle2,
   Cloud,
   FilePlus2,
+  Fingerprint,
   HelpCircle,
   LogOut,
   Mail,
@@ -29,6 +31,7 @@ import {
 interface TeacherCabinetViewProps {
   teacherProfile: TeacherProfileData | null;
   classes: SchoolClassItem[];
+  studentsRecords?: StudentRecord[];
   isFirebaseAuthenticated: boolean;
   firebaseEmail: string | null;
   onCompletePhoneRegistration: (
@@ -49,6 +52,11 @@ interface TeacherCabinetViewProps {
   ) => void;
   parentContacts?: Record<string, ParentContact>;
   onSaveParentContact?: (studentName: string, contact: ParentContact) => void;
+  onSaveStudentReferenceUrl?: (
+    classItem: SchoolClassItem,
+    studentName: string,
+    handwritingReferenceUrl: string
+  ) => Promise<void>;
   onConnectGoogleCloud: () => Promise<void>;
   onLogout: () => Promise<void>;
 }
@@ -81,6 +89,7 @@ export function formatRussianPhone(raw: string): string {
 export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
   teacherProfile,
   classes,
+  studentsRecords = [],
   isFirebaseAuthenticated,
   firebaseEmail,
   onCompletePhoneRegistration,
@@ -91,6 +100,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
   onCreateNotebookForStudent,
   parentContacts = {},
   onSaveParentContact,
+  onSaveStudentReferenceUrl,
   onConnectGoogleCloud,
   onLogout,
 }) => {
@@ -144,6 +154,12 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
   const [draftParentEmail, setDraftParentEmail] = useState('');
   const [parentFormError, setParentFormError] = useState<string | null>(null);
 
+  // Inline handwriting_reference_url editor for a student in the class roster
+  const [editingRefKey, setEditingRefKey] = useState<string | null>(null);
+  const [draftReferenceUrl, setDraftReferenceUrl] = useState('');
+  const [referenceFormError, setReferenceFormError] = useState<string | null>(null);
+  const [isSavingReferenceUrl, setIsSavingReferenceUrl] = useState(false);
+
   // Step 1: Request SMS code
   const handleSendOtp = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -171,7 +187,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
         throw new Error(data.error || 'Не удалось отправить СМС-код');
       }
       setOtpHintMessage(data.message);
-      setOtpCode(data.demoCodeHint || '4825');
+      setOtpCode(data.demoCodeHint || '');
       setOtpStep('verify');
     } catch (err: any) {
       setAuthError(err?.message || 'Ошибка при отправке СМС-кода');
@@ -485,7 +501,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                   maxLength={6}
                   value={otpCode}
                   onChange={(e) => setOtpCode(e.target.value)}
-                  placeholder="4825"
+                  placeholder="0000"
                   className="w-full px-4 py-2.5 text-lg font-mono-tabular font-bold tracking-widest text-center border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-600"
                   required
                 />
@@ -574,7 +590,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
             {showFirebasePhoneGuide && (
               <div className="pt-2 text-xs text-slate-600 space-y-1.5 border-t border-slate-100">
                 <p>
-                  В приложении уже работает встроенная проверка номера по СМС-коду (код <code className="font-mono-tabular font-semibold">4825</code>). Для подключения внешней рассылки СМС через Firebase Authentication:
+                  В приложении работает встроенная проверка номера по одноразовому СМС-коду из уведомления выше. Для подключения внешней рассылки СМС через Firebase Authentication:
                 </p>
                 <ol className="list-decimal list-inside space-y-1">
                   <li>Откройте консоль проекта Firebase → раздел <strong>Authentication</strong>.</li>
@@ -1030,6 +1046,15 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                         const rowKey = `${cls.id}:${stuName}`;
                         const existingContact = parentContacts[stuName];
                         const isEditingParent = editingParentKey === rowKey;
+                        const matchedStudentRecord = studentsRecords.find(
+                          (sr) =>
+                            sr.studentName.trim().toLowerCase() ===
+                              stuName.trim().toLowerCase() &&
+                            (!sr.classId || sr.classId === cls.id)
+                        );
+                        const savedRefUrl =
+                          matchedStudentRecord?.handwriting_reference_url || '';
+                        const isEditingRef = editingRefKey === rowKey;
 
                         return (
                           <div key={idx} className="px-3 py-2 text-xs hover:bg-slate-50/70">
@@ -1052,9 +1077,39 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                                         : ''}
                                     </div>
                                   )}
+                                {savedRefUrl && (
+                                  <div className="text-[11px] text-emerald-700 pl-5 truncate flex items-center gap-1">
+                                    <Fingerprint className="w-3 h-3 shrink-0" />
+                                    <span>Эталон почерка сохранён</span>
+                                  </div>
+                                )}
                               </div>
 
-                              <div className="flex items-center gap-3 shrink-0">
+                              <div className="flex flex-wrap items-center gap-3 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (isEditingRef) {
+                                      setEditingRefKey(null);
+                                      setReferenceFormError(null);
+                                    } else {
+                                      setEditingRefKey(rowKey);
+                                      setEditingParentKey(null);
+                                      setDraftReferenceUrl(savedRefUrl);
+                                      setReferenceFormError(null);
+                                    }
+                                  }}
+                                  className={`flex items-center gap-1 font-medium whitespace-nowrap cursor-pointer ${
+                                    savedRefUrl
+                                      ? 'text-emerald-700 hover:text-emerald-900'
+                                      : 'text-slate-600 hover:text-slate-900'
+                                  }`}
+                                >
+                                  <Fingerprint className="w-3 h-3" />
+                                  <span>
+                                    {savedRefUrl ? 'Эталон почерка' : '+ Эталон фото'}
+                                  </span>
+                                </button>
                                 <button
                                   type="button"
                                   onClick={() => {
@@ -1063,6 +1118,7 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                                       setParentFormError(null);
                                     } else {
                                       setEditingParentKey(rowKey);
+                                      setEditingRefKey(null);
                                       setDraftParentFullName(
                                         existingContact?.parentFullName || ''
                                       );
@@ -1099,6 +1155,104 @@ export const TeacherCabinetView: React.FC<TeacherCabinetViewProps> = ({
                                 </button>
                               </div>
                             </div>
+
+                            {isEditingRef && (
+                              <form
+                                onSubmit={async (e) => {
+                                  e.preventDefault();
+                                  const raw = draftReferenceUrl.trim();
+                                  if (raw) {
+                                    try {
+                                      const parsed = new URL(raw);
+                                      if (
+                                        parsed.protocol !== 'https:' &&
+                                        parsed.protocol !== 'http:'
+                                      ) {
+                                        throw new Error('protocol');
+                                      }
+                                    } catch {
+                                      setReferenceFormError(
+                                        'Укажите корректную ссылку на изображение эталона почерка (начинается с https:// или http://).'
+                                      );
+                                      return;
+                                    }
+                                  }
+                                  setIsSavingReferenceUrl(true);
+                                  setReferenceFormError(null);
+                                  try {
+                                    await onSaveStudentReferenceUrl?.(
+                                      cls,
+                                      stuName,
+                                      raw
+                                    );
+                                    setEditingRefKey(null);
+                                  } catch (err: any) {
+                                    setReferenceFormError(
+                                      err?.message ||
+                                        'Не удалось сохранить ссылку на эталон почерка.'
+                                    );
+                                  } finally {
+                                    setIsSavingReferenceUrl(false);
+                                  }
+                                }}
+                                className="mt-2 p-2.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2"
+                              >
+                                <label
+                                  htmlFor={`ref-url-${rowKey}`}
+                                  className="block text-[11px] font-medium text-slate-700"
+                                >
+                                  Ссылка на фото эталона почерка (handwriting_reference_url):
+                                </label>
+                                <div className="flex items-center gap-2">
+                                  <input
+                                    id={`ref-url-${rowKey}`}
+                                    type="url"
+                                    value={draftReferenceUrl}
+                                    onChange={(e) =>
+                                      setDraftReferenceUrl(e.target.value)
+                                    }
+                                    placeholder="https://example.ru/handwriting-sample.jpg"
+                                    className="flex-1 px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-600"
+                                  />
+                                  {draftReferenceUrl.trim() && (
+                                    <img
+                                      src={draftReferenceUrl.trim()}
+                                      alt={`Эталон почерка ${stuName}`}
+                                      referrerPolicy="no-referrer"
+                                      className="w-8 h-8 rounded object-cover border border-slate-300 shrink-0 bg-white"
+                                      onError={(ev) => {
+                                        (ev.currentTarget as HTMLImageElement).style.display =
+                                          'none';
+                                      }}
+                                    />
+                                  )}
+                                </div>
+                                {referenceFormError && (
+                                  <p className="text-[11px] text-red-600">
+                                    {referenceFormError}
+                                  </p>
+                                )}
+                                <div className="flex items-center justify-end gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setEditingRefKey(null);
+                                      setReferenceFormError(null);
+                                    }}
+                                    className="px-2 py-1 text-[11px] text-slate-600 hover:text-slate-900 cursor-pointer"
+                                  >
+                                    Отмена
+                                  </button>
+                                  <button
+                                    type="submit"
+                                    disabled={isSavingReferenceUrl}
+                                    className="px-2.5 py-1 text-[11px] font-semibold bg-slate-900 text-white rounded-md hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
+                                  >
+                                    {isSavingReferenceUrl ? 'Сохраняем...' : 'Сохранить'}
+                                  </button>
+                                </div>
+                              </form>
+                            )}
 
                             {isEditingParent && (
                               <form

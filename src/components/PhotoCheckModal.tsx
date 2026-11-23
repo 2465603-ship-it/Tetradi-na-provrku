@@ -6,6 +6,8 @@ import {
   ErrorCategory,
   SchoolClassItem,
   HandwritingVerificationResult,
+  StudentRecord,
+  StudentIdentificationResult,
 } from '../types/notebook';
 import { SAMPLE_PHOTOS } from '../data/initialSubmissions';
 import { safeParseJsonResponse } from '../utils/api';
@@ -20,6 +22,8 @@ import {
   Sparkles,
   Trash2,
   Upload,
+  UserCheck,
+  UserSearch,
   X,
   AlertCircle,
   Edit3,
@@ -33,6 +37,7 @@ interface PhotoCheckModalProps {
   onClose: () => void;
   onAddCheckedSubmission: (submission: NotebookSubmission) => void;
   classes: SchoolClassItem[];
+  studentsRecords?: StudentRecord[];
   activeClassGroup?: string;
   activeStudentName?: string;
   activeSubject?: SubjectType;
@@ -104,6 +109,7 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
   onClose,
   onAddCheckedSubmission,
   classes,
+  studentsRecords = [],
   activeClassGroup,
   activeStudentName,
   activeSubject,
@@ -158,9 +164,19 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
     useState<HandwritingVerificationResult | null>(null);
   const [handwritingError, setHandwritingError] = useState<string | null>(null);
 
+  // Automatic Student Identification by Handwriting (identify_student)
+  const [isIdentifyingStudent, setIsIdentifyingStudent] = useState(false);
+  const [identificationResult, setIdentificationResult] =
+    useState<StudentIdentificationResult | null>(null);
+  const [identificationError, setIdentificationError] = useState<string | null>(
+    null
+  );
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileCameraInputRef = useRef<HTMLInputElement | null>(null);
   const referenceFileInputRef = useRef<HTMLInputElement | null>(null);
+  const studentNameInputRef = useRef<HTMLInputElement | null>(null);
+  const studentSelectRef = useRef<HTMLSelectElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
@@ -249,6 +265,8 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
       setAnalysisResult(null);
       setErrorMsg(null);
       setCameraError(null);
+      setIdentificationResult(null);
+      setIdentificationError(null);
       setStudentWrittenText('');
 
       try {
@@ -656,6 +674,180 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
     }
   };
 
+  // Build candidate students with handwriting_reference_url (from Firestore students) or local cached reference photos
+  const candidateStudentsForIdentify = (() => {
+    const seen = new Set<string>();
+    const list: Array<{
+      studentName: string;
+      handwriting_reference_url?: string;
+      referenceImageBase64?: string;
+      referenceMimeType?: string;
+    }> = [];
+
+    const activeClassId = selectedClassObj?.id;
+    const prioritizedRecords = [
+      ...studentsRecords.filter(
+        (s) => s.handwriting_reference_url && s.classId === activeClassId
+      ),
+      ...studentsRecords.filter(
+        (s) => s.handwriting_reference_url && s.classId !== activeClassId
+      ),
+    ];
+
+    for (const rec of prioritizedRecords) {
+      const key = rec.studentName.trim().toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      list.push({
+        studentName: rec.studentName.trim(),
+        handwriting_reference_url: rec.handwriting_reference_url.trim(),
+      });
+    }
+
+    for (const stuName of classStudents) {
+      const key = stuName.trim().toLowerCase();
+      if (!key || seen.has(key)) continue;
+      try {
+        const localSample = localStorage.getItem(`tetrad_plus_hw_ref:${key}`);
+        if (localSample) {
+          seen.add(key);
+          list.push({
+            studentName: stuName.trim(),
+            referenceImageBase64: localSample,
+            referenceMimeType: 'image/jpeg',
+          });
+        }
+      } catch {
+        // ignore localStorage read errors
+      }
+    }
+
+    return list;
+  })();
+
+  const handleIdentifyStudentByHandwriting = async () => {
+    setIdentificationError(null);
+    setIdentificationResult(null);
+
+    let activeBase64 = customImageBase64;
+    if (isCameraActive) {
+      const snapped = handleCaptureSnapshotFromCamera();
+      if (snapped) activeBase64 = snapped;
+    }
+
+    if (
+      (selectedSample === 'custom' || selectedSample === 'camera') &&
+      !activeBase64
+    ) {
+      setIdentificationError(
+        'Сначала сфотографируйте или загрузите фото тетради. После этого можно запустить распознавание автора, либо введите ФИО ученика вручную.'
+      );
+      studentNameInputRef.current?.focus();
+      return;
+    }
+
+    if (candidateStudentsForIdentify.length === 0) {
+      setIdentificationError(
+        'Ни у одного ученика ещё не задан эталон почерка (handwriting_reference_url) в Личном кабинете. Выберите ученика из списка или введите ФИО вручную.'
+      );
+      if (classStudents.length > 0) {
+        studentSelectRef.current?.focus();
+      } else {
+        studentNameInputRef.current?.focus();
+      }
+      return;
+    }
+
+    setIsIdentifyingStudent(true);
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (authToken) {
+        headers.Authorization = `Bearer ${authToken}`;
+      }
+
+      const response = await fetch('/api/identify-student', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          imageBase64: activeBase64,
+          mimeType: customMimeType,
+          sampleId:
+            selectedSample === 'math'
+              ? 'math'
+              : selectedSample === 'russian'
+              ? 'russian'
+              : 'custom',
+          students: candidateStudentsForIdentify,
+        }),
+      });
+
+      const data = await safeParseJsonResponse(response);
+      if (response.status === 401 && onAuthExpired) {
+        onAuthExpired();
+      }
+      if (!response.ok) {
+        throw new Error(
+          data?.error ||
+            'Не удалось определить автора по почерку. Выберите или введите ученика вручную.'
+        );
+      }
+
+      const result: StudentIdentificationResult = {
+        identified: Boolean(data?.identified),
+        studentName:
+          typeof data?.studentName === 'string' && data.studentName.trim()
+            ? data.studentName.trim()
+            : null,
+        confidencePercent: Number(data?.confidencePercent ?? 0),
+        autoSelected: Boolean(data?.autoSelected),
+        reasoning: String(data?.reasoning || ''),
+        candidateScores: Array.isArray(data?.candidateScores)
+          ? data.candidateScores
+          : [],
+        skippedReferences: Array.isArray(data?.skippedReferences)
+          ? data.skippedReferences
+          : [],
+        modelUsed: data?.modelUsed,
+      };
+
+      setIdentificationResult(result);
+
+      // Requirement 3: Auto-select in selectbox if confidence > 85%; otherwise ask teacher to select manually
+      if (
+        result.identified &&
+        result.studentName &&
+        result.confidencePercent > 85
+      ) {
+        const matchedName = result.studentName;
+        const matchedClass = classes.find((c) =>
+          (c.studentsList || '')
+            .split('\n')
+            .map((s) => s.trim().toLowerCase())
+            .includes(matchedName.toLowerCase())
+        );
+        if (matchedClass && matchedClass.name !== classGroup) {
+          setClassGroup(matchedClass.name);
+        }
+        setStudentName(matchedName);
+      } else if (!result.identified) {
+        studentNameInputRef.current?.focus();
+      } else {
+        // <= 85% confidence: prompt manual selection in selectbox
+        studentSelectRef.current?.focus();
+      }
+    } catch (err: any) {
+      setIdentificationError(
+        err?.message ||
+          'Почерк не опознан из-за ошибки сервиса распознавания. Пожалуйста, выберите ученика из списка или введите ФИО вручную.'
+      );
+      studentNameInputRef.current?.focus();
+    } finally {
+      setIsIdentifyingStudent(false);
+    }
+  };
+
   const handleSaveToQueue = () => {
     if (!analysisResult) return;
 
@@ -833,23 +1025,52 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
               </div>
 
               <div>
-                <label
-                  htmlFor="modal-student-name"
-                  className="block text-xs font-semibold text-slate-800 mb-1"
-                >
-                  Фамилия и имя ученика ({classGroup})
-                </label>
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+                  <label
+                    htmlFor="modal-student-name"
+                    className="block text-xs font-semibold text-slate-800"
+                  >
+                    Фамилия и имя ученика ({classGroup})
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleIdentifyStudentByHandwriting}
+                    disabled={isIdentifyingStudent}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 disabled:bg-slate-400 text-white rounded-md transition-colors cursor-pointer"
+                  >
+                    {isIdentifyingStudent ? (
+                      <>
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        <span>Определяем автора...</span>
+                      </>
+                    ) : (
+                      <>
+                        <UserSearch className="w-3 h-3" />
+                        <span>Определить автора по почерку</span>
+                      </>
+                    )}
+                  </button>
+                </div>
                 <div className="flex gap-2">
                   <input
+                    ref={studentNameInputRef}
                     id="modal-student-name"
                     type="text"
                     value={studentName}
                     onChange={(e) => setStudentName(e.target.value)}
                     placeholder="Введите или выберите ученика..."
-                    className="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-sky-600"
+                    className={`flex-1 px-3 py-1.5 text-xs border rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-sky-600 ${
+                      identificationError ||
+                      (identificationResult &&
+                        (!identificationResult.identified ||
+                          identificationResult.confidencePercent <= 85))
+                        ? 'border-amber-400 ring-1 ring-amber-300'
+                        : 'border-slate-300'
+                    }`}
                   />
                   {classStudents.length > 0 && (
                     <select
+                      ref={studentSelectRef}
                       aria-label="Выбрать ученика из списка класса"
                       value={
                         classStudents.includes(studentName) ? studentName : ''
@@ -857,7 +1078,13 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
                       onChange={(e) => {
                         if (e.target.value) setStudentName(e.target.value);
                       }}
-                      className="px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg bg-white text-slate-700"
+                      className={`px-2.5 py-1.5 text-xs border rounded-lg bg-white text-slate-700 ${
+                        identificationResult &&
+                        identificationResult.identified &&
+                        identificationResult.confidencePercent <= 85
+                          ? 'border-amber-500 ring-2 ring-amber-300'
+                          : 'border-slate-300'
+                      }`}
                     >
                       <option value="">Из списка класса...</option>
                       {classStudents.map((stu, i) => (
@@ -868,6 +1095,120 @@ export const PhotoCheckModal: React.FC<PhotoCheckModalProps> = ({
                     </select>
                   )}
                 </div>
+
+                {/* Recognized Student Preview & Confidence Handling (>85% auto-select / <=85% manual / Error fallback) */}
+                {identificationResult && (
+                  <div
+                    className={`mt-2.5 p-2.5 rounded-lg border text-xs space-y-1.5 ${
+                      identificationResult.identified &&
+                      identificationResult.confidencePercent > 85
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-950'
+                        : identificationResult.identified
+                        ? 'bg-amber-50 border-amber-300 text-amber-950'
+                        : 'bg-red-50 border-red-200 text-red-900'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        {(() => {
+                          const matchedRef = studentsRecords.find(
+                            (r) =>
+                              r.studentName.trim().toLowerCase() ===
+                              (identificationResult.studentName || '').toLowerCase()
+                          );
+                          return matchedRef?.handwriting_reference_url ? (
+                            <img
+                              src={matchedRef.handwriting_reference_url}
+                              alt={`Эталон почерка ${matchedRef.studentName}`}
+                              referrerPolicy="no-referrer"
+                              className="w-9 h-9 rounded object-cover border border-white shadow-2xs shrink-0"
+                            />
+                          ) : (
+                            <div className="w-9 h-9 rounded bg-white/80 border border-slate-200 flex items-center justify-center shrink-0">
+                              <UserCheck className="w-4 h-4 text-slate-600" />
+                            </div>
+                          );
+                        })()}
+                        <div className="min-w-0">
+                          {identificationResult.identified &&
+                          identificationResult.confidencePercent > 85 ? (
+                            <div className="font-semibold text-emerald-900 truncate">
+                              Распознан ученик: {identificationResult.studentName}
+                            </div>
+                          ) : identificationResult.identified ? (
+                            <div className="font-semibold text-amber-950 truncate">
+                              Вероятный автор: {identificationResult.studentName} — выберите вручную
+                            </div>
+                          ) : (
+                            <div className="font-semibold text-red-900">
+                              Почерк не опознан — укажите ученика вручную
+                            </div>
+                          )}
+                          <div className="text-[11px] opacity-85">
+                            {identificationResult.identified
+                              ? identificationResult.confidencePercent > 85
+                                ? `Уверенность ${identificationResult.confidencePercent}% (> 85%) — ученик выбран автоматически`
+                                : `Уверенность ${identificationResult.confidencePercent}% (ниже 85%) — подтвердите ученика в выпадающем списке`
+                              : 'Укажите ФИО ученика вручную в поле выше или выберите из списка.'}
+                          </div>
+                        </div>
+                      </div>
+
+                      {identificationResult.identified && (
+                        <span
+                          className={`font-mono-tabular font-bold text-xs px-2 py-0.5 rounded shrink-0 ${
+                            identificationResult.confidencePercent > 85
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-amber-200 text-amber-950'
+                          }`}
+                        >
+                          {identificationResult.confidencePercent}%
+                        </span>
+                      )}
+                    </div>
+
+                    {identificationResult.reasoning && (
+                      <p className="text-[11px] leading-snug opacity-90">
+                        {identificationResult.reasoning}
+                      </p>
+                    )}
+
+                    {identificationResult.identified &&
+                      identificationResult.confidencePercent <= 85 &&
+                      identificationResult.studentName && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                          <span className="text-[11px] font-medium">
+                            Пожалуйста, выберите ученика в списке вручную.
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (identificationResult.studentName) {
+                                setStudentName(identificationResult.studentName);
+                              }
+                            }}
+                            className="px-2.5 py-1 text-[11px] font-semibold bg-amber-900 text-white rounded hover:bg-amber-800 cursor-pointer"
+                          >
+                            Выбрать «{identificationResult.studentName}»
+                          </button>
+                        </div>
+                      )}
+                  </div>
+                )}
+
+                {identificationError && (
+                  <div className="mt-2.5 p-2.5 rounded-lg border border-red-200 bg-red-50 text-red-900 text-xs flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <div className="font-semibold">
+                        Не удалось автоматически опознать автора
+                      </div>
+                      <p className="text-[11px] leading-snug">
+                        {identificationError}
+                      </p>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 

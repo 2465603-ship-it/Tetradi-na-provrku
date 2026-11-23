@@ -1,6 +1,9 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
+import dns from 'dns/promises';
+import net from 'net';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import { createWorker } from 'tesseract.js';
@@ -986,7 +989,7 @@ async function startServer() {
 
   // In-memory store for phone OTP verification codes
   const otpStore = new Map<string, { code: string; expiresAt: number }>();
-  const defaultDemoOtp = process.env.DEMO_OTP_CODE || '4825';
+  const configuredDemoOtp = process.env.DEMO_OTP_CODE?.trim() || '';
 
   app.post('/api/auth/send-otp', (req, res) => {
     const { phone } = req.body || {};
@@ -1000,7 +1003,7 @@ async function startServer() {
       });
     }
     const normalizedPhone = phone.replace(/\D/g, '');
-    const code = defaultDemoOtp;
+    const code = configuredDemoOtp || String(crypto.randomInt(1000, 10000));
     otpStore.set(normalizedPhone, {
       code,
       expiresAt: Date.now() + 10 * 60 * 1000,
@@ -1021,10 +1024,12 @@ async function startServer() {
 
     if (
       !cleanCode ||
-      (stored && stored.code !== cleanCode && cleanCode !== defaultDemoOtp)
+      !stored ||
+      stored.expiresAt <= Date.now() ||
+      stored.code !== cleanCode
     ) {
       return res.status(400).json({
-        error: `Неверный код из СМС. Проверьте введённые 4 цифры (код: ${defaultDemoOtp}).`,
+        error: 'Неверный или истёкший код из СМС. Запросите код повторно.',
       });
     }
 
@@ -1481,6 +1486,391 @@ ${
         error:
           error?.message ||
           'Не удалось выполнить графологическую сверку почерка. Проверьте чёткость изображений и наличие GEMINI_API_KEY.',
+      });
+    }
+  });
+
+  // SSRF Guard helpers for fetching student handwriting_reference_url images
+  function isPrivateOrRestrictedIp(rawIp: string): boolean {
+    const ip = rawIp.trim().toLowerCase();
+    if (ip.startsWith('::ffff:')) {
+      return isPrivateOrRestrictedIp(ip.slice(7));
+    }
+    const family = net.isIP(ip);
+    if (family === 4) {
+      const parts = ip.split('.').map(Number);
+      if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return true;
+      const [a, b] = parts;
+      if (a === 0 || a === 10 || a === 127) return true;
+      if (a === 169 && b === 254) return true;
+      if (a === 172 && b >= 16 && b <= 31) return true;
+      if (a === 192 && b === 168) return true;
+      if (a === 100 && b >= 64 && b <= 127) return true;
+      if (a >= 224) return true;
+      return false;
+    }
+    if (family === 6) {
+      if (ip === '::' || ip === '::1') return true;
+      if (ip.startsWith('fe80:') || ip.startsWith('fc') || ip.startsWith('fd')) {
+        return true;
+      }
+      if (ip.startsWith('ff')) return true;
+      return false;
+    }
+    return true;
+  }
+
+  async function validatePublicHttpUrl(rawUrl: string): Promise<URL> {
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl.trim());
+    } catch {
+      throw new Error('Некорректный формат URL эталона почерка.');
+    }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new Error('Допустимы только внешние ссылки https:// или http://.');
+    }
+    if (parsed.username || parsed.password) {
+      throw new Error('URL с встроенными учётными данными запрещён.');
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    if (
+      !hostname ||
+      hostname === 'localhost' ||
+      hostname.endsWith('.localhost') ||
+      hostname.endsWith('.local') ||
+      hostname.endsWith('.internal') ||
+      hostname === 'metadata.google.internal'
+    ) {
+      throw new Error('Запросы к локальным и внутренним адресам запрещены.');
+    }
+
+    if (net.isIP(hostname)) {
+      if (isPrivateOrRestrictedIp(hostname)) {
+        throw new Error('IP-адрес относится к закрытой или локальной сети.');
+      }
+      return parsed;
+    }
+
+    const resolved = await dns.lookup(hostname, { all: true });
+    if (!resolved || resolved.length === 0) {
+      throw new Error('Не удалось разрешить доменное имя эталона.');
+    }
+    for (const addr of resolved) {
+      if (isPrivateOrRestrictedIp(addr.address)) {
+        throw new Error('Адрес эталона указывает на внутреннюю сеть.');
+      }
+    }
+    return parsed;
+  }
+
+  async function fetchReferenceImageSafe(
+    rawUrl: string,
+    redirectDepth = 0
+  ): Promise<{ data: string; mimeType: string }> {
+    const validatedUrl = await validatePublicHttpUrl(rawUrl);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+
+    try {
+      const resp = await fetch(validatedUrl.toString(), {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: {
+          Accept: 'image/*',
+          'User-Agent': 'TetradPlus-HandwritingVerifier/1.0',
+        },
+      });
+
+      if (resp.status >= 300 && resp.status < 400) {
+        const location = resp.headers.get('location');
+        if (!location || redirectDepth >= 2) {
+          throw new Error('Превышен лимит переадресаций при загрузке эталона.');
+        }
+        const nextUrl = new URL(location, validatedUrl).toString();
+        return fetchReferenceImageSafe(nextUrl, redirectDepth + 1);
+      }
+
+      if (!resp.ok) {
+        throw new Error(`Эталон не загружен (HTTP ${resp.status}).`);
+      }
+
+      const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+      const mimeType = contentType.split(';')[0].trim();
+      if (!mimeType.startsWith('image/')) {
+        throw new Error('Ссылка на эталон должна вести на изображение (image/*).');
+      }
+
+      const contentLengthHeader = Number(resp.headers.get('content-length') || 0);
+      const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+      if (contentLengthHeader > MAX_IMAGE_BYTES) {
+        throw new Error('Размер эталонного изображения превышает 5 МБ.');
+      }
+
+      const arrayBuffer = await resp.arrayBuffer();
+      if (arrayBuffer.byteLength === 0) {
+        throw new Error('Файл эталонного изображения пуст.');
+      }
+      if (arrayBuffer.byteLength > MAX_IMAGE_BYTES) {
+        throw new Error('Размер эталонного изображения превышает 5 МБ.');
+      }
+
+      return {
+        data: Buffer.from(arrayBuffer).toString('base64'),
+        mimeType,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  interface IdentifyCandidateInput {
+    studentName: string;
+    handwriting_reference_url?: string;
+    referenceImageBase64?: string;
+    referenceMimeType?: string;
+  }
+
+  async function identify_student(
+    currentImage: { data: string; mimeType: string },
+    candidates: IdentifyCandidateInput[]
+  ) {
+    const limitedCandidates = candidates.slice(0, 15);
+    const loadedCandidates: Array<{
+      studentName: string;
+      referenceUrl?: string;
+      image: { data: string; mimeType: string };
+    }> = [];
+    const skippedReferences: Array<{ studentName: string; reason: string }> = [];
+
+    for (const candidate of limitedCandidates) {
+      const cleanName =
+        typeof candidate?.studentName === 'string'
+          ? candidate.studentName.trim().slice(0, 120)
+          : '';
+      if (!cleanName) continue;
+
+      const refUrl =
+        typeof candidate?.handwriting_reference_url === 'string'
+          ? candidate.handwriting_reference_url.trim()
+          : '';
+
+      if (refUrl) {
+        try {
+          const downloaded = await fetchReferenceImageSafe(refUrl);
+          loadedCandidates.push({
+            studentName: cleanName,
+            referenceUrl: refUrl,
+            image: downloaded,
+          });
+          continue;
+        } catch (err: any) {
+          skippedReferences.push({
+            studentName: cleanName,
+            reason: err?.message || 'Не удалось загрузить эталон по ссылке',
+          });
+          continue;
+        }
+      }
+
+      if (candidate?.referenceImageBase64) {
+        const inlinePayload = resolveImagePayload(
+          candidate.referenceImageBase64,
+          candidate.referenceMimeType || 'image/jpeg'
+        );
+        if (inlinePayload) {
+          loadedCandidates.push({
+            studentName: cleanName,
+            image: inlinePayload,
+          });
+          continue;
+        }
+      }
+
+      skippedReferences.push({
+        studentName: cleanName,
+        reason: 'Не указана ссылка handwriting_reference_url',
+      });
+    }
+
+    if (loadedCandidates.length === 0) {
+      return {
+        identified: false,
+        studentName: null,
+        confidencePercent: 0,
+        autoSelected: false,
+        reasoning:
+          'Не найдено ни одного доступного эталона почерка (handwriting_reference_url). Выберите ученика вручную.',
+        candidateScores: [],
+        skippedReferences,
+      };
+    }
+
+    const parts: Array<{
+      text?: string;
+      inlineData?: { data: string; mimeType: string };
+    }> = [
+      { text: 'Анализируемая фотография школьной тетради (неизвестный автор):' },
+      {
+        inlineData: {
+          mimeType: currentImage.mimeType,
+          data: currentImage.data,
+        },
+      },
+    ];
+
+    const studentRefDescriptions: string[] = [];
+    loadedCandidates.forEach((item, index) => {
+      const refLabel = item.referenceUrl
+        ? `${item.studentName} (эталон ${index + 1}: ${item.referenceUrl})`
+        : `${item.studentName} (эталон ${index + 1})`;
+      studentRefDescriptions.push(refLabel);
+      parts.push({ text: `Эталон почерка ученика «${item.studentName}»:` });
+      parts.push({
+        inlineData: {
+          mimeType: item.image.mimeType,
+          data: item.image.data,
+        },
+      });
+    });
+
+    const prompt = `Сравни это фото с эталонами следующих учеников: [${studentRefDescriptions.join(', ')}].
+Верни имя того, чей почерк совпадает с наибольшей вероятностью, и процент уверенности (число от 0 до 100).
+
+Критерии анализа:
+1. Сравни наклон букв, нажим, высоту и ширину символов, связки между буквами, характерные элементы написания букв ('а', 'о', 'д', 'т', 'р') или цифр.
+2. Оцени процент уверенности максимально объективно от 0 до 100.
+3. Если почерк на фото неразборчив, слишком размыт или ни один из эталонов не совпадает, установи identified: false и confidencePercent: 0.`;
+
+    parts.push({ text: prompt });
+
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        identified: {
+          type: Type.BOOLEAN,
+          description:
+            'true, если почерк удалось сопоставить с одним из эталонов, false — если почерк не опознан или неразборчив.',
+        },
+        bestMatchName: {
+          type: Type.STRING,
+          description:
+            'Точное имя ученика из переданного списка эталонов с наибольшим совпадением почерка (пустая строка, если не опознан).',
+        },
+        confidencePercent: {
+          type: Type.NUMBER,
+          description: 'Процент уверенности от 0 до 100.',
+        },
+        reasoning: {
+          type: Type.STRING,
+          description:
+            'Краткое графологическое пояснение сравнения почерка (на русском языке).',
+        },
+        candidateScores: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              studentName: { type: Type.STRING },
+              confidencePercent: { type: Type.NUMBER },
+            },
+            required: ['studentName', 'confidencePercent'],
+          },
+        },
+      },
+      required: [
+        'identified',
+        'bestMatchName',
+        'confidencePercent',
+        'reasoning',
+        'candidateScores',
+      ],
+    };
+
+    const { modelUsed, parsed } = await callGeminiMultimodalWithFallback(
+      parts,
+      'Ты — эксперт по графологии и визуальной идентификации почерка школьников. Сравнивай почерк на проверяемом фото с эталонами максимально критично и отвечай строго в формате JSON на русском языке.',
+      schema
+    );
+
+    const rawConfidence = Number(parsed?.confidencePercent);
+    const confidencePercent = Number.isFinite(rawConfidence)
+      ? Math.max(0, Math.min(100, Math.round(rawConfidence)))
+      : 0;
+
+    const rawBestName =
+      typeof parsed?.bestMatchName === 'string'
+        ? parsed.bestMatchName.trim()
+        : '';
+    const matchedCandidate = loadedCandidates.find(
+      (c) => c.studentName.toLowerCase() === rawBestName.toLowerCase()
+    );
+    const resolvedName = matchedCandidate ? matchedCandidate.studentName : null;
+    const identified = Boolean(parsed?.identified) && Boolean(resolvedName) && confidencePercent > 0;
+
+    const normalizedScores = Array.isArray(parsed?.candidateScores)
+      ? parsed.candidateScores
+          .map((item: any) => ({
+            studentName: String(item?.studentName || '').trim(),
+            confidencePercent: Math.max(
+              0,
+              Math.min(100, Math.round(Number(item?.confidencePercent) || 0))
+            ),
+          }))
+          .filter((item: any) => item.studentName.length > 0)
+      : [];
+
+    return {
+      identified,
+      studentName: identified ? resolvedName : null,
+      confidencePercent: identified ? confidencePercent : 0,
+      autoSelected: identified && confidencePercent > 85,
+      reasoning:
+        typeof parsed?.reasoning === 'string' && parsed.reasoning.trim()
+          ? parsed.reasoning.trim()
+          : identified
+          ? 'Графологический анализ завершён.'
+          : 'Почерк не удалось надёжно сопоставить ни с одним из эталонов.',
+      candidateScores: normalizedScores,
+      skippedReferences,
+      modelUsed,
+    };
+  }
+
+  // Endpoint 3.1: Automatic Student Identification by Handwriting (identify_student)
+  app.post('/api/identify-student', requireFirebaseAuth, async (req, res) => {
+    try {
+      const {
+        imageBase64,
+        mimeType = 'image/jpeg',
+        sampleId = '',
+        students = [],
+      } = req.body || {};
+
+      const imagePayload = resolveImagePayload(imageBase64, mimeType, sampleId);
+      if (!imagePayload) {
+        return res.status(400).json({
+          error:
+            'Загрузите фотографию тетради, чтобы система могла определить автора по почерку.',
+        });
+      }
+
+      if (!Array.isArray(students) || students.length === 0) {
+        return res.status(400).json({
+          error:
+            'В списке класса нет учеников с загруженным эталоном почерка (handwriting_reference_url). Выберите ученика вручную.',
+        });
+      }
+
+      const result = await identify_student(imagePayload, students);
+      return res.json(result);
+    } catch (error: any) {
+      console.error('Error in /api/identify-student:', error);
+      return res.status(502).json({
+        error:
+          error?.message ||
+          'Не удалось автоматически определить автора по почерку. Пожалуйста, выберите ученика вручную.',
       });
     }
   });

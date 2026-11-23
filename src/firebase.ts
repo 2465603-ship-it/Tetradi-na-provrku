@@ -24,20 +24,48 @@ import {
   onSnapshot,
   serverTimestamp,
 } from 'firebase/firestore';
-import firebaseConfig from '../firebase-applet-config.json';
 import {
   TeacherProfileData,
   SchoolClassItem,
   PaperRulingType,
+  StudentRecord,
 } from './types/notebook';
 
-const resolvedClientApiKey =
-  (import.meta as any).env?.VITE_FIREBASE_API_KEY ||
-  (firebaseConfig as Record<string, any>).apiKey ||
-  '';
+const optionalConfigModules = import.meta.glob('../firebase-applet-config.json', {
+  eager: true,
+}) as Record<string, { default?: Record<string, any> }>;
+
+const fileConfig: Record<string, any> =
+  optionalConfigModules['../firebase-applet-config.json']?.default ||
+  (optionalConfigModules['../firebase-applet-config.json'] as any) ||
+  {};
+
+const envVars = ((import.meta as any).env || {}) as Record<string, string | undefined>;
+
+const resolvedFirebaseConfig: Record<string, any> = {
+  projectId: envVars.VITE_FIREBASE_PROJECT_ID || fileConfig.projectId || '',
+  appId: envVars.VITE_FIREBASE_APP_ID || fileConfig.appId || '',
+  apiKey: envVars.VITE_FIREBASE_API_KEY || fileConfig.apiKey || '',
+  authDomain: envVars.VITE_FIREBASE_AUTH_DOMAIN || fileConfig.authDomain || '',
+  storageBucket:
+    envVars.VITE_FIREBASE_STORAGE_BUCKET || fileConfig.storageBucket || '',
+  messagingSenderId:
+    envVars.VITE_FIREBASE_MESSAGING_SENDER_ID ||
+    fileConfig.messagingSenderId ||
+    '',
+  measurementId:
+    envVars.VITE_FIREBASE_MEASUREMENT_ID || fileConfig.measurementId || '',
+  oAuthClientId: fileConfig.oAuthClientId || '',
+  recaptchaSiteKey: fileConfig.recaptchaSiteKey || '',
+  firestoreDatabaseId:
+    envVars.VITE_FIREBASE_DATABASE_ID || fileConfig.firestoreDatabaseId || '',
+};
 
 export const isClientFirebaseConfigured = Boolean(
-  resolvedClientApiKey && resolvedClientApiKey !== 'MY_FIREBASE_WEB_API_KEY'
+  resolvedFirebaseConfig.apiKey &&
+    resolvedFirebaseConfig.apiKey !== 'MY_FIREBASE_WEB_API_KEY' &&
+    resolvedFirebaseConfig.projectId &&
+    resolvedFirebaseConfig.projectId !== 'MY_FIREBASE_PROJECT_ID'
 );
 
 let app: FirebaseApp | null = null;
@@ -45,15 +73,12 @@ export let db: Firestore | null = null;
 export let auth: Auth | null = null;
 
 if (isClientFirebaseConfigured) {
-  app = initializeApp({
-    ...firebaseConfig,
-    apiKey: resolvedClientApiKey,
-  });
-  const firestoreDbId = (firebaseConfig as Record<string, any>)
-    .firestoreDatabaseId;
+  app = initializeApp(resolvedFirebaseConfig);
+  const firestoreDbId = resolvedFirebaseConfig.firestoreDatabaseId;
   db = firestoreDbId ? getFirestore(app, firestoreDbId) : getFirestore(app);
   auth = getAuth(app);
 }
+
 
 // Validate connection to Firestore on boot (Mandatory per firebase-integration-rpc skill)
 async function testConnection() {
@@ -272,6 +297,30 @@ export async function createClassInFirestore(
   }
 }
 
+export async function ensureClassExistsInFirestore(
+  uid: string,
+  classId: string,
+  classData: Omit<SchoolClassItem, 'id' | 'ownerId'>
+): Promise<void> {
+  if (!db) return;
+  const safeClassId = sanitizeId(classId);
+  const path = `classes/${safeClassId}`;
+  try {
+    const docRef = doc(db, 'classes', safeClassId);
+    const snap = await getDoc(docRef);
+    if (!snap.exists()) {
+      const clean = sanitizeClassPayload(uid, classData);
+      await setDoc(docRef, {
+        ...clean,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
 export async function updateClassInFirestore(
   uid: string,
   classId: string,
@@ -332,6 +381,131 @@ export function subscribeToTeacherClasses(
           defaultRuling: data.defaultRuling as PaperRulingType,
           studentCount: data.studentCount,
           studentsList: data.studentsList,
+        };
+      });
+      onData(items);
+    },
+    (error) => {
+      if (onError) onError(error);
+      handleFirestoreError(error, OperationType.LIST, path);
+    }
+  );
+}
+
+// Student Firestore Operations (students collection with handwriting_reference_url)
+export function validateHttpUrl(rawUrl: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.length > 2048) {
+    throw new Error('Ссылка на эталон почерка не должна превышать 2048 символов.');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('Введите корректную URL-ссылку (начинающуюся с https:// или http://).');
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('Допустимы только ссылки с протоколом https:// или http://.');
+  }
+  return parsed.toString();
+}
+
+export function buildStudentDocId(classId: string, studentName: string): string {
+  const safeClass = sanitizeId(classId).slice(0, 48);
+  const normalized = studentName.trim().toLowerCase();
+  let hash = 2166136261;
+  for (let i = 0; i < normalized.length; i++) {
+    hash ^= normalized.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const hex = (hash >>> 0).toString(16).padStart(8, '0');
+  return sanitizeId(`stu_${safeClass}_${hex}`);
+}
+
+export function sanitizeStudentPayload(
+  uid: string,
+  student: Omit<StudentRecord, 'id' | 'ownerId'>
+) {
+  const safeUid = sanitizeId(uid);
+  const safeClassId = sanitizeId(student.classId);
+  const studentName = (student.studentName || '').trim().slice(0, 120);
+  const handwriting_reference_url = validateHttpUrl(
+    student.handwriting_reference_url || ''
+  );
+
+  return {
+    ownerId: safeUid,
+    classId: safeClassId,
+    studentName: studentName.length >= 1 ? studentName : 'Ученик',
+    handwriting_reference_url,
+  };
+}
+
+export async function upsertStudentInFirestore(
+  uid: string,
+  studentId: string,
+  student: Omit<StudentRecord, 'id' | 'ownerId'>
+): Promise<void> {
+  if (!db) return;
+  const safeStudentId = sanitizeId(studentId);
+  const path = `students/${safeStudentId}`;
+  const clean = sanitizeStudentPayload(uid, student);
+
+  try {
+    const docRef = doc(db, 'students', safeStudentId);
+    const existingSnap = await getDoc(docRef);
+
+    if (!existingSnap.exists()) {
+      await setDoc(docRef, {
+        ...clean,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(docRef, {
+        studentName: clean.studentName,
+        handwriting_reference_url: clean.handwriting_reference_url,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function deleteStudentFromFirestore(studentId: string): Promise<void> {
+  if (!db) return;
+  const safeStudentId = sanitizeId(studentId);
+  const path = `students/${safeStudentId}`;
+  try {
+    await deleteDoc(doc(db, 'students', safeStudentId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
+export function subscribeToTeacherStudents(
+  uid: string,
+  onData: (students: StudentRecord[]) => void,
+  onError?: (err: unknown) => void
+) {
+  if (!db) return () => {};
+  const safeUid = sanitizeId(uid);
+  const path = 'students';
+  const q = query(collection(db, 'students'), where('ownerId', '==', safeUid));
+
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const items: StudentRecord[] = snapshot.docs.map((d) => {
+        const data = d.data();
+        return {
+          id: d.id,
+          ownerId: data.ownerId,
+          classId: data.classId,
+          studentName: data.studentName,
+          handwriting_reference_url: data.handwriting_reference_url || '',
         };
       });
       onData(items);

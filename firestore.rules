@@ -123,6 +123,44 @@ service cloud.firestore {
       data.updatedAt is timestamp;
     }
 
+    // Validation Blueprint: Student (with handwriting_reference_url)
+    function isValidStudent(data) {
+      return data.keys().hasAll([
+        'ownerId',
+        'classId',
+        'studentName',
+        'handwriting_reference_url',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'ownerId',
+        'classId',
+        'studentName',
+        'handwriting_reference_url',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.ownerId is string &&
+      data.ownerId.size() >= 1 &&
+      data.ownerId.size() <= 128 &&
+      data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.ownerId == request.auth.uid &&
+      data.classId is string &&
+      data.classId.size() >= 1 &&
+      data.classId.size() <= 128 &&
+      data.classId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.studentName is string &&
+      data.studentName.size() >= 1 &&
+      data.studentName.size() <= 120 &&
+      data.handwriting_reference_url is string &&
+      data.handwriting_reference_url.size() >= 0 &&
+      data.handwriting_reference_url.size() <= 2048 &&
+      (data.handwriting_reference_url == '' || data.handwriting_reference_url.matches('^https?://.+')) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
     // Collection 1: /teachers/{teacherId} (PII Isolated to Owner only, no list allowed)
     match /teachers/{teacherId} {
       allow get: if isVerifiedUser() && isValidId(teacherId) && request.auth.uid == teacherId;
@@ -196,6 +234,44 @@ service cloud.firestore {
 
       allow delete: if isVerifiedUser() &&
         isValidId(classId) &&
+        existing().ownerId == request.auth.uid;
+    }
+
+    // Collection 3: /students/{studentId}
+    match /students/{studentId} {
+      allow get: if isVerifiedUser() &&
+        isValidId(studentId) &&
+        existing().ownerId == request.auth.uid;
+
+      allow list: if isVerifiedUser() &&
+        resource.data.ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(studentId) &&
+        isValidStudent(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/classes/$(incoming().classId)) &&
+        get(/databases/$(database)/documents/classes/$(incoming().classId)).data.ownerId == request.auth.uid;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(studentId) &&
+        isValidStudent(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().classId == existing().classId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'studentName',
+            'handwriting_reference_url',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser() &&
+        isValidId(studentId) &&
         existing().ownerId == request.auth.uid;
     }
   }
